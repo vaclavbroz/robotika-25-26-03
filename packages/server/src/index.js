@@ -79,6 +79,9 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PORT = Number(process.env.PORT || 8010);
 const HOST = process.env.HOST || "0.0.0.0";
 const CLIENT_PORT = Number(process.env.CLIENT_PORT || 8000);
+const DEV_AUTO_RESTART = process.env.DEV_AUTO_RESTART === "1";
+const DEV_RESTART_NOTICE_MS = Number(process.env.DEV_RESTART_NOTICE_MS || 1400);
+const DEV_RESTART_SHUTDOWN_GRACE_MS = 250;
 
 const world = new WorldState();
 
@@ -126,11 +129,57 @@ server.listen(PORT, HOST, () => {
   console.log(`[server] client url http://${clientHost}:${CLIENT_PORT}`);
 });
 
-setInterval(() => {
+const simulationTimer = setInterval(() => {
   world.simulateTick(SIM_DT_SECONDS, SIMULATION_CONFIG);
   broadcastReplicationUpdate();
   broadcastCollisionEvents();
 }, tickMs);
+
+let shuttingDown = false;
+
+process.on("SIGINT", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(0));
+
+function shutdown(exitCode) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+
+  clearInterval(simulationTimer);
+
+  if (DEV_AUTO_RESTART) {
+    broadcastJson({
+      type: "serverRestarting",
+      delayMs: DEV_RESTART_NOTICE_MS,
+      message: "Server update in progress. Reconnecting soon.",
+    });
+    setTimeout(closeSocketsAndExit, DEV_RESTART_SHUTDOWN_GRACE_MS).unref();
+    return;
+  }
+
+  closeSocketsAndExit();
+
+  function closeSocketsAndExit() {
+    for (const connection of socketsByPlayerId.values()) {
+      connection.closed = true;
+      if (!connection.socket.destroyed) {
+        connection.socket.end();
+        connection.socket.destroy();
+      }
+    }
+    socketsByPlayerId.clear();
+    lastSentPlayerStateById.clear();
+
+    server.close(() => {
+      process.exit(exitCode);
+    });
+
+    setTimeout(() => {
+      process.exit(exitCode);
+    }, 1000).unref();
+  }
+}
 
 function initPlayerSession(connection) {
   const playerId = randomUUID();

@@ -34,6 +34,43 @@ canvas {
   text-shadow: 0 0 8px rgba(255, 255, 255, 0.6);
 }
 
+#dev-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: rgba(6, 10, 18, 0.64);
+  backdrop-filter: blur(8px);
+  z-index: 20;
+}
+
+#dev-overlay[hidden] {
+  display: none;
+}
+
+#dev-overlay-panel {
+  width: min(480px, calc(100vw - 32px));
+  padding: 20px 24px;
+  border-radius: 14px;
+  border: 1px solid rgba(180, 216, 255, 0.4);
+  background: rgba(10, 18, 31, 0.92);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.36);
+  text-align: center;
+}
+
+#dev-overlay-panel h2 {
+  margin: 0 0 8px;
+  font-size: 28px;
+}
+
+#dev-overlay-panel p {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.4;
+  opacity: 0.95;
+}
+
 #help {
   position: absolute;
   top: 50%;

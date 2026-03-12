@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node ./src/index.js",
+    "dev": "node ./scripts/dev-watch.mjs",
     "start": "node ./src/index.js"
   }
 }

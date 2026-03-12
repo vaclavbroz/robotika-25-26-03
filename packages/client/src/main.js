@@ -149,6 +149,9 @@ const net = {
   sentInputs: 0,
   recvStates: 0,
   lastDebugLogAtMs: 0,
+  reconnectTimer: null,
+  restartExpectedUntilMs: 0,
+  reconnectEnabled: false,
 };
 
 const cameraTarget = new THREE.Vector3();
@@ -172,11 +175,15 @@ let hasEverCapturedPointer = false;
 const help = document.getElementById("help");
 const helpTitle = document.getElementById("help-title");
 const helpText = document.getElementById("help-text");
+const devOverlay = document.getElementById("dev-overlay");
+const devOverlayTitle = document.getElementById("dev-overlay-title");
+const devOverlayText = document.getElementById("dev-overlay-text");
 const nickInput = document.getElementById("nick-input");
 const connectButton = document.getElementById("connect-btn");
 const colorInput = document.getElementById("color-input");
 const patternSelect = document.getElementById("pattern-select");
 const avatarPreviewCanvas = document.getElementById("avatar-preview-canvas");
+const CLIENT_UPDATE_OVERLAY_DEBOUNCE_MS = 160;
 
 const onKey = (pressed) => (event) => {
   switch (event.code) {
@@ -298,6 +305,7 @@ window.addEventListener("blur", () => {
 
 const clock = new THREE.Clock();
 initConnectUi();
+initDevNotifications();
 
 function animate() {
   requestAnimationFrame(animate);
@@ -338,6 +346,7 @@ function animate() {
 animate();
 
 function connectToServer() {
+  clearReconnectTimer();
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const host = window.location.hostname || "127.0.0.1";
   const url = `${protocol}://${host}:${WS_PORT}`;
@@ -351,6 +360,8 @@ function connectToServer() {
   socket.addEventListener("open", () => {
     net.connected = true;
     net.connecting = false;
+    net.reconnectEnabled = true;
+    net.restartExpectedUntilMs = 0;
     updateConnectUi();
     socket.send(
       JSON.stringify({
@@ -362,6 +373,7 @@ function connectToServer() {
         },
       }),
     );
+    hideDevOverlay();
     setHelpStatus("Connected. Click panel or press L to capture mouse.", "Connected");
   });
 
@@ -376,6 +388,7 @@ function connectToServer() {
   });
 
   socket.addEventListener("close", () => {
+    const reconnectExpected = isReconnectExpected();
     net.connected = false;
     net.connecting = false;
     net.playerId = null;
@@ -390,13 +403,21 @@ function connectToServer() {
     document.body.classList.remove("connected");
     document.body.classList.remove("playing");
     updateConnectUi();
+    if (reconnectExpected && net.reconnectEnabled) {
+      showDevOverlay("Server Restarting", "Server update in progress. Reconnecting soon.");
+      scheduleReconnect(Math.max(250, net.restartExpectedUntilMs - performance.now()));
+      setHelpStatus("Server restart in progress. Reconnecting soon.", "Reconnecting");
+      return;
+    }
     setHelpStatus("Disconnected from server.", "Disconnected");
   });
 
   socket.addEventListener("error", () => {
     net.connecting = false;
     updateConnectUi();
-    setHelpStatus(`Connection error. Ensure server is running on port ${WS_PORT}.`, "Connection Error");
+    if (!isReconnectExpected()) {
+      setHelpStatus(`Connection error. Ensure server is running on port ${WS_PORT}.`, "Connection Error");
+    }
   });
 }
 
@@ -460,6 +481,13 @@ function onServerMessage(message) {
 
   if (message.type === "collisions") {
     handleCollisionAudio(message.collisions);
+    return;
+  }
+
+  if (message.type === "serverRestarting") {
+    const delayMs = Number(message.delayMs);
+    net.restartExpectedUntilMs = performance.now() + (Number.isFinite(delayMs) ? Math.max(250, delayMs) : 1400);
+    showDevOverlay("Server Restarting", message.message || "Server update in progress. Reconnecting soon.");
     return;
   }
 
@@ -1244,6 +1272,7 @@ function startConnectFromUi() {
   if (net.connected || net.connecting) {
     return;
   }
+  net.reconnectEnabled = true;
   ensureAudioContext();
   net.nickname = sanitizeNickname(nickInput?.value);
   net.avatarColor = normalizeAvatarColor(colorInput?.value);
@@ -1262,6 +1291,66 @@ function startConnectFromUi() {
   window.localStorage.setItem("hra.avatarColor", net.avatarColor);
   window.localStorage.setItem("hra.avatarPattern", net.avatarPattern);
   connectToServer();
+}
+
+function initDevNotifications() {
+  if (!import.meta.hot) {
+    return;
+  }
+
+  let clientUpdateOverlayTimer = null;
+  import.meta.hot.on("dev:client-update-pending", (data) => {
+    clearTimeout(clientUpdateOverlayTimer);
+    clientUpdateOverlayTimer = setTimeout(() => {
+      const delayMs = Number(data?.delayMs);
+      const seconds = Math.max(1, Math.round((Number.isFinite(delayMs) ? delayMs : 1400) / 100) / 10);
+      showDevOverlay("Client Updating", `Client changes detected. Reloading this tab in about ${seconds}s.`);
+    }, CLIENT_UPDATE_OVERLAY_DEBOUNCE_MS);
+  });
+}
+
+function showDevOverlay(title, text) {
+  unlockPointer();
+  if (devOverlayTitle) {
+    devOverlayTitle.textContent = title;
+  }
+  if (devOverlayText) {
+    devOverlayText.textContent = text;
+  }
+  if (devOverlay) {
+    devOverlay.hidden = false;
+  }
+}
+
+function hideDevOverlay() {
+  if (devOverlay) {
+    devOverlay.hidden = true;
+  }
+}
+
+function scheduleReconnect(delayMs) {
+  if (!net.reconnectEnabled) {
+    return;
+  }
+
+  clearReconnectTimer();
+  net.reconnectTimer = window.setTimeout(() => {
+    net.reconnectTimer = null;
+    if (!net.connected && !net.connecting) {
+      connectToServer();
+    }
+  }, delayMs);
+}
+
+function clearReconnectTimer() {
+  if (net.reconnectTimer !== null) {
+    window.clearTimeout(net.reconnectTimer);
+    net.reconnectTimer = null;
+  }
+}
+
+function isReconnectExpected() {
+  return net.restartExpectedUntilMs > performance.now();
 }
 
 function onAvatarOptionsChanged() {

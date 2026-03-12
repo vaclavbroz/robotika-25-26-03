@@ -8,7 +8,10 @@ const portsConfigPath = path.join(scriptDir, "dev-ports.json");
 const portsConfig = readPortsConfig(portsConfigPath);
 const appPort = portsConfig.appPort;
 const wsPort = portsConfig.wsPort;
-const externalIp = readExternalIp(path.resolve(scriptDir, "../../setup/.wsl_external_ip"));
+const externalIp = readExternalIp([
+  path.resolve(scriptDir, "../../.ip"),
+  path.resolve(scriptDir, "../../.wsl_external_ip"),
+]);
 const studentHost = externalIp || "localhost";
 const studentUrl = `http://${studentHost}:${appPort}/`;
 
@@ -103,15 +106,20 @@ function toValidPort(value, name) {
   return parsed;
 }
 
-function readExternalIp(filePath) {
-  if (!existsSync(filePath)) {
-    return null;
+function readExternalIp(filePaths) {
+  for (const filePath of filePaths) {
+    if (!existsSync(filePath)) {
+      continue;
+    }
+    try {
+      const raw = readFileSync(filePath, "utf8");
+      const value = raw.split(/\r?\n/)[0]?.trim();
+      if (value) {
+        return value;
+      }
+    } catch {
+      // Ignore unreadable files and continue to the next fallback path.
+    }
   }
-  try {
-    const raw = readFileSync(filePath, "utf8");
-    const value = raw.split(/\r?\n/)[0]?.trim();
-    return value || null;
-  } catch {
-    return null;
-  }
+  return null;
 }

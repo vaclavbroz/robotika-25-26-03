@@ -30,6 +30,50 @@ const SIMULATION_CONFIG = {
   playerCollisionRadius: 0.75,
   playerCollisionRestitution: 0.93,
   playerCollisionIterations: 3,
+  parkedPlane: {
+    x: 95,
+    z: -56,
+    boardingRadius: 16,
+  },
+  planeMinAltitude: 1.6,
+  planeCruiseSpeed: 18,
+  planeBoostSpeed: 18,
+  planeBrakeSpeed: 10,
+  planeMinSpeed: 10,
+  planeTurnSpeed: 1.7,
+  planeClimbRate: 14,
+  planeCrashHazards: [
+    { name: "airport-terminal", minX: 67, maxX: 91, minZ: -83, maxZ: -61, height: 14 },
+    { name: "station-building", minX: -46, maxX: -22, minZ: 132, maxZ: 142, height: 14 },
+    { name: "city", minX: -142, maxX: -76, minZ: -70, maxZ: -12, height: 36 },
+    { name: "forest", minX: 63, maxX: 141, minZ: 76, maxZ: 160, height: 13 },
+  ],
+  staticObstacles: [
+    {
+      name: "airport-terminal",
+      type: "rect",
+      minX: 67,
+      maxX: 91,
+      minZ: -83,
+      maxZ: -61,
+    },
+    {
+      name: "rail-corridor",
+      type: "rect",
+      minX: -248,
+      maxX: 248,
+      minZ: 154,
+      maxZ: 158,
+    },
+    {
+      name: "station-building",
+      type: "rect",
+      minX: -46,
+      maxX: -22,
+      minZ: 132,
+      maxZ: 142,
+    },
+  ],
 };
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PORT = Number(process.env.PORT || 8010);
@@ -176,13 +220,22 @@ function broadcastReplicationUpdate() {
 
 function broadcastCollisionEvents() {
   if (!Array.isArray(world.recentCollisions) || world.recentCollisions.length === 0) {
+  } else {
+    broadcastJson({
+      type: "collisions",
+      tick: world.tick,
+      collisions: world.recentCollisions.slice(0, 24),
+    });
+  }
+
+  if (!Array.isArray(world.recentPlaneCrashes) || world.recentPlaneCrashes.length === 0) {
     return;
   }
 
   broadcastJson({
-    type: "collisions",
+    type: "plane_crashes",
     tick: world.tick,
-    collisions: world.recentCollisions.slice(0, 24),
+    crashes: world.recentPlaneCrashes.slice(0, 12),
   });
 }
 
@@ -283,6 +336,14 @@ function onFrame(connection, opcode, payload) {
     }
 
     player.applyInput(parseInputMessage(message));
+    return;
+  }
+
+  if (message.type === "toggle_plane") {
+    const player = world.getPlayer(connection.playerId);
+    if (player) {
+      player.togglePlaneMode(SIMULATION_CONFIG);
+    }
   }
 }
 

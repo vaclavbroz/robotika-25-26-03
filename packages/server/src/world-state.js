@@ -5,6 +5,7 @@ export class WorldState {
     this.tick = 0;
     this.players = new Map();
     this.recentCollisions = [];
+    this.recentPlaneCrashes = [];
   }
 
   incrementTick() {
@@ -15,6 +16,7 @@ export class WorldState {
   simulateTick(dtSeconds, config) {
     this.incrementTick();
     this.recentCollisions = [];
+    this.recentPlaneCrashes = [];
     const previousPositionsById = new Map();
     for (const player of this.players.values()) {
       previousPositionsById.set(player.playerId, {
@@ -23,6 +25,10 @@ export class WorldState {
         z: player.position.z,
       });
       player.simulateTick(dtSeconds, config);
+      const planeCrash = player.consumePlaneCrash?.();
+      if (planeCrash) {
+        this.recentPlaneCrashes.push(planeCrash);
+      }
     }
     this.resolvePlayerCollisions(config, previousPositionsById);
     return this.tick;
@@ -167,6 +173,8 @@ export class WorldState {
 
           a.enforceWorldBounds(config);
           b.enforceWorldBounds(config);
+          a.enforceStaticObstacles(config);
+          b.enforceStaticObstacles(config);
           enforceGroundContact(a, config);
           enforceGroundContact(b, config);
         }

@@ -23,7 +23,7 @@ const INPUT_BUTTON_BACKWARD = 1 << 2;
 const INPUT_BUTTON_LEFT = 1 << 3;
 const INPUT_BUTTON_RIGHT = 1 << 4;
 const DEBUG_NET = new URLSearchParams(window.location.search).get("debugNet") === "1";
-const WS_PORT = parsePort(import.meta.env.VITE_WS_PORT, 8010);
+const WS_PORT = parsePort(import.meta.env.VITE_WS_PORT, 9003);
 const AIRPORT_CENTER = { x: 122, z: -88 };
 const AIRPORT_RUNWAY_LENGTH = 118;
 const AIRPORT_RUNWAY_WIDTH = 24;
@@ -34,7 +34,16 @@ const RAILWAY_Y = 8.2;
 const RAILWAY_STATION_X = -34;
 const CITY_CENTER = { x: -108, z: -42 };
 const FOREST_CENTER = { x: 102, z: 118 };
-const PARKED_PLANE_POSITION = { x: 95, z: -56 };
+const PARKED_PLANE_POSITION = { x: 122, z: -88 };
+const PARKED_CAR_POSITION = { x: 8, z: 6 };
+const PARKED_CAR_YAW = Math.PI * 0.35;
+const DAY_DURATION_SECONDS = 5 * 60;
+const NIGHT_DURATION_SECONDS = 3 * 60;
+const DAY_NIGHT_CYCLE_SECONDS = DAY_DURATION_SECONDS + NIGHT_DURATION_SECONDS;
+const DAY_SKY_COLOR = new THREE.Color(0x87c9ff);
+const NIGHT_SKY_COLOR = new THREE.Color(0x07111d);
+const DAY_FOG_COLOR = new THREE.Color(0x87c9ff);
+const NIGHT_FOG_COLOR = new THREE.Color(0x09131f);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87c9ff);
@@ -144,6 +153,7 @@ const net = {
   samplesByPlayerId: new Map(),
   playerAvatarsById: new Map(),
   playerPlanesById: new Map(),
+  playerCarsById: new Map(),
   latestServerTick: 0,
   lastStateAtMs: 0,
   sentInputs: 0,
@@ -160,12 +170,17 @@ const rollDelta = new THREE.Vector3();
 const rollAxis = new THREE.Vector3();
 const rollQuat = new THREE.Quaternion();
 const airportTraffic = [];
+const runwayLights = [];
 const railwayTraffic = [];
 const activeExplosions = [];
 const parkedPlaneState = {
   mesh: null,
 };
+const parkedCarState = {
+  mesh: null,
+};
 createAirport();
+createParkedCar();
 createRailway();
 createCity();
 createForest();
@@ -318,6 +333,7 @@ function animate() {
   updateAirportTraffic(clock.elapsedTime);
   updateRailwayTraffic(clock.elapsedTime);
   updateExplosions(dt);
+  updateDayNightCycle(clock.elapsedTime);
 
   lookDirection.set(
     Math.sin(player.courseYaw) * Math.cos(player.pitch),
@@ -326,6 +342,8 @@ function animate() {
   );
   const localState = net.playerId ? net.playersById.get(net.playerId) : null;
   const localPlane = net.playerId ? net.playerPlanesById.get(net.playerId) : null;
+  const localCar = net.playerId ? net.playerCarsById.get(net.playerId) : null;
+  updatePlaneWarning(localState);
   if (localState?.inPlane && localPlane) {
     const behindOffset = new THREE.Vector3(-16, 5.2, 0);
     const lookOffset = new THREE.Vector3(20, 1.8, 0);
@@ -333,6 +351,14 @@ function animate() {
     lookOffset.applyQuaternion(localPlane.quaternion);
     camera.position.copy(localPlane.position).add(behindOffset);
     cameraTarget.copy(localPlane.position).add(lookOffset);
+    camera.lookAt(cameraTarget);
+  } else if (localState?.inCar && localCar) {
+    const behindOffset = new THREE.Vector3(0, 4.2, -10);
+    const lookOffset = new THREE.Vector3(0, 1.6, 10);
+    behindOffset.applyQuaternion(localCar.quaternion);
+    lookOffset.applyQuaternion(localCar.quaternion);
+    camera.position.copy(localCar.position).add(behindOffset);
+    cameraTarget.copy(localCar.position).add(lookOffset);
     camera.lookAt(cameraTarget);
   } else {
     camera.position.copy(player.position);
@@ -400,6 +426,9 @@ function connectToServer() {
     for (const playerId of net.playerPlanesById.keys()) {
       removePlayerPlane(playerId);
     }
+    for (const playerId of net.playerCarsById.keys()) {
+      removePlayerCar(playerId);
+    }
     document.body.classList.remove("connected");
     document.body.classList.remove("playing");
     updateConnectUi();
@@ -440,6 +469,9 @@ function onServerMessage(message) {
     for (const playerId of net.playerPlanesById.keys()) {
       removePlayerPlane(playerId);
     }
+    for (const playerId of net.playerCarsById.keys()) {
+      removePlayerCar(playerId);
+    }
 
     const snapshotPlayers = Array.isArray(message.snapshot?.players) ? message.snapshot.players : [];
     applyServerPlayerStates(snapshotPlayers, message.snapshot?.tick, { replaceAll: true });
@@ -458,6 +490,7 @@ function onServerMessage(message) {
     net.samplesByPlayerId.delete(message.playerId);
     removePlayerAvatar(message.playerId);
     removePlayerPlane(message.playerId);
+    removePlayerCar(message.playerId);
     return;
   }
 
@@ -530,6 +563,11 @@ function applyServerPlayerStates(playerStates, tick, options = {}) {
     for (const playerId of net.playerPlanesById.keys()) {
       if (!net.playersById.has(playerId)) {
         removePlayerPlane(playerId);
+      }
+    }
+    for (const playerId of net.playerCarsById.keys()) {
+      if (!net.playersById.has(playerId)) {
+        removePlayerCar(playerId);
       }
     }
   }
@@ -633,6 +671,7 @@ function syncRenderedPlayersFromServer() {
   for (const [playerId, state] of net.playersById) {
     if (playerId === net.playerId) {
       if (state?.inPlane) {
+        removePlayerCar(playerId);
         const plane = getOrCreatePlayerPlane(playerId, state?.avatar);
         const x = Number(state?.position?.x) || 0;
         const y = Number(state?.position?.y) || 0;
@@ -644,12 +683,25 @@ function syncRenderedPlayersFromServer() {
         plane.rotateZ((Number(state?.pitch) || 0) * 0.35);
       } else {
         removePlayerPlane(playerId);
+        if (state?.inCar) {
+          const car = getOrCreatePlayerCar(playerId, state?.avatar);
+          const x = Number(state?.position?.x) || 0;
+          const y = Number(state?.position?.y) || 0;
+          const z = Number(state?.position?.z) || 0;
+          const terrainY = terrainBaseForSphereAt(x, z, AVATAR_BALL_RADIUS);
+          car.position.set(x, terrainY + Math.max(0, y) + 0.05, z);
+          car.rotation.set(0, -(Number(state?.yaw) || 0), 0, "YXZ");
+          car.rotateY(Math.PI);
+        } else {
+          removePlayerCar(playerId);
+        }
       }
       continue;
     }
 
     if (state?.inPlane) {
       removePlayerAvatar(playerId);
+      removePlayerCar(playerId);
       const x = Number(state?.position?.x) || 0;
       const y = Number(state?.position?.y) || 0;
       const z = Number(state?.position?.z) || 0;
@@ -662,7 +714,22 @@ function syncRenderedPlayersFromServer() {
       continue;
     }
 
+    if (state?.inCar) {
+      removePlayerAvatar(playerId);
+      removePlayerPlane(playerId);
+      const x = Number(state?.position?.x) || 0;
+      const y = Number(state?.position?.y) || 0;
+      const z = Number(state?.position?.z) || 0;
+      const terrainY = terrainBaseForSphereAt(x, z, AVATAR_BALL_RADIUS);
+      const car = getOrCreatePlayerCar(playerId, state?.avatar);
+      car.position.set(x, terrainY + Math.max(0, y) + 0.05, z);
+      car.rotation.set(0, -(Number(state?.yaw) || 0), 0, "YXZ");
+      car.rotateY(Math.PI);
+      continue;
+    }
+
     removePlayerPlane(playerId);
+    removePlayerCar(playerId);
     const sample = sampleInterpolatedPosition(playerId);
     const position = sample ?? state?.position;
     if (!position) {
@@ -730,23 +797,132 @@ function removePlayerPlane(playerId) {
   net.playerPlanesById.delete(playerId);
 }
 
+function getOrCreatePlayerCar(playerId, avatar) {
+  const existing = net.playerCarsById.get(playerId);
+  if (existing) {
+    return existing;
+  }
+
+  const car = createPersonalCar({
+    body: normalizeAvatarColor(avatar?.color),
+    accent: 0x18232f,
+    scale: 0.9,
+  });
+  scene.add(car);
+  net.playerCarsById.set(playerId, car);
+  return car;
+}
+
+function removePlayerCar(playerId) {
+  const car = net.playerCarsById.get(playerId);
+  if (!car) {
+    return;
+  }
+
+  scene.remove(car);
+  car.traverse((node) => {
+    if (node.geometry) {
+      node.geometry.dispose();
+    }
+    if (node.material) {
+      if (Array.isArray(node.material)) {
+        for (const material of node.material) {
+          material.dispose();
+        }
+      } else {
+        node.material.dispose();
+      }
+    }
+  });
+  net.playerCarsById.delete(playerId);
+}
+
 function updateParkedPlaneAvailability(authoritative, x, z) {
   if (!parkedPlaneState.mesh) {
     return;
   }
   const localInPlane = authoritative?.inPlane === true;
+  const localInCar = authoritative?.inCar === true;
   parkedPlaneState.mesh.visible = !localInPlane;
-
-  if (!localInPlane) {
-    setHelpStatus("Press F to board the plane on the airport and fly.", "Aircraft Ready");
+  if (parkedCarState.mesh) {
+    parkedCarState.mesh.visible = !localInCar;
   }
+
+  if (!localInPlane && !localInCar) {
+    const planeDistance = Math.hypot(x - PARKED_PLANE_POSITION.x, z - PARKED_PLANE_POSITION.z);
+    const carDistance = Math.hypot(x - PARKED_CAR_POSITION.x, z - PARKED_CAR_POSITION.z);
+    if (carDistance <= 12 && carDistance < planeDistance) {
+      setHelpStatus("Press F to board the car and drive.", "Car Ready");
+    } else if (planeDistance <= 18) {
+      setHelpStatus("Press F to board the plane on the airport and fly.", "Aircraft Ready");
+    }
+  }
+}
+
+function updatePlaneWarning(localState) {
+  if (!localState?.inPlane) {
+    return;
+  }
+
+  if (shouldShowPullUpWarning(localState)) {
+    setHelpStatus("Terrain ahead. Climb or align with the runway.", "PULL UP");
+  }
+}
+
+function shouldShowPullUpWarning(localState) {
+  const position = localState?.position;
+  const velocity = localState?.velocity;
+  if (!position || !velocity) {
+    return false;
+  }
+
+  const currentX = Number(position.x) || 0;
+  const currentZ = Number(position.z) || 0;
+  const currentAltitude = Number(position.y) || 0;
+  const vx = Number(velocity.x) || 0;
+  const vy = Number(velocity.y) || 0;
+  const vz = Number(velocity.z) || 0;
+  const horizontalSpeed = Math.hypot(vx, vz);
+  if (vy >= -0.35 || horizontalSpeed < 6) {
+    return false;
+  }
+
+  const currentWorldY = terrainBaseForSphereAt(currentX, currentZ, AVATAR_BALL_RADIUS) + Math.max(0, currentAltitude);
+  const lookaheadSeconds = 4.5;
+  const stepSeconds = 0.2;
+
+  for (let t = stepSeconds; t <= lookaheadSeconds; t += stepSeconds) {
+    const sampleX = currentX + vx * t;
+    const sampleZ = currentZ + vz * t;
+    const projectedWorldY = currentWorldY + vy * t;
+    const terrainY = terrainBaseForSphereAt(sampleX, sampleZ, AVATAR_BALL_RADIUS);
+    const clearance = projectedWorldY - terrainY;
+    if (clearance > AVATAR_BALL_RADIUS + 0.2) {
+      continue;
+    }
+
+    return !isPointOnRunway(sampleX, sampleZ);
+  }
+
+  return false;
+}
+
+function isPointOnRunway(x, z) {
+  const halfWidth = AIRPORT_RUNWAY_WIDTH * 0.5;
+  const halfLength = AIRPORT_RUNWAY_LENGTH * 0.5;
+  return (
+    x >= AIRPORT_CENTER.x - halfWidth &&
+    x <= AIRPORT_CENTER.x + halfWidth &&
+    z >= AIRPORT_CENTER.z - halfLength &&
+    z <= AIRPORT_CENTER.z + halfLength
+  );
 }
 
 function togglePlaneBoarding() {
   if (!net.connected || !net.socket || net.socket.readyState !== WebSocket.OPEN) {
     return;
   }
-  net.socket.send(JSON.stringify({ type: "toggle_plane" }));
+  net.socket.send(JSON.stringify({ type: "toggle_vehicle" }));
 }
 
 function getOrCreatePlayerAvatar(playerId) {
@@ -1782,6 +1958,7 @@ function createAirport() {
           AIRPORT_CENTER.z - AIRPORT_RUNWAY_LENGTH * 0.5 + 8 + i * 9.2,
         );
         airport.add(light);
+        runwayLights.push(light);
       }
     }
   }
@@ -1795,6 +1972,64 @@ function createAirport() {
   });
 
   scene.add(airport);
+}
+
+function updateDayNightCycle(elapsedTime) {
+  const cycleTime = elapsedTime % DAY_NIGHT_CYCLE_SECONDS;
+  const isNight = cycleTime >= DAY_DURATION_SECONDS;
+  const phase = isNight
+    ? (cycleTime - DAY_DURATION_SECONDS) / NIGHT_DURATION_SECONDS
+    : cycleTime / DAY_DURATION_SECONDS;
+  const blend = isNight ? smoothstep(phase) : 1 - smoothstep(phase);
+
+  scene.background.copy(DAY_SKY_COLOR).lerp(NIGHT_SKY_COLOR, blend);
+  scene.fog.color.copy(DAY_FOG_COLOR).lerp(NIGHT_FOG_COLOR, blend);
+  skyDome.material.color.copy(scene.background);
+  ambient.intensity = THREE.MathUtils.lerp(0.62, 0.12, blend);
+  ambient.color.setRGB(
+    THREE.MathUtils.lerp(0.91, 0.16, blend),
+    THREE.MathUtils.lerp(0.94, 0.2, blend),
+    THREE.MathUtils.lerp(1.0, 0.34, blend),
+  );
+  ambient.groundColor.setRGB(
+    THREE.MathUtils.lerp(0.2, 0.03, blend),
+    THREE.MathUtils.lerp(0.25, 0.05, blend),
+    THREE.MathUtils.lerp(0.13, 0.08, blend),
+  );
+  sun.intensity = THREE.MathUtils.lerp(1.1, 0.08, blend);
+  bounce.intensity = THREE.MathUtils.lerp(0.28, 0.04, blend);
+  terrainMaterial.color.setRGB(
+    THREE.MathUtils.lerp(0.44, 0.11, blend),
+    THREE.MathUtils.lerp(0.56, 0.16, blend),
+    THREE.MathUtils.lerp(0.35, 0.2, blend),
+  );
+
+  const runwayGlow = isNight ? THREE.MathUtils.lerp(0.4, 1.5, smoothstep(phase)) : 0;
+  for (const light of runwayLights) {
+    if (!(light.material instanceof THREE.MeshStandardMaterial)) {
+      continue;
+    }
+    light.material.emissiveIntensity = runwayGlow;
+  }
+}
+
+function createParkedCar() {
+  const car = createPersonalCar({
+    body: 0xce3535,
+    accent: 0xf4f0d8,
+    scale: 0.95,
+  });
+  const groundY = terrainHeight(PARKED_CAR_POSITION.x, PARKED_CAR_POSITION.z);
+  car.position.set(PARKED_CAR_POSITION.x, groundY + 0.05, PARKED_CAR_POSITION.z);
+  car.rotation.y = Math.PI - PARKED_CAR_YAW;
+  car.traverse((node) => {
+    if (node instanceof THREE.Mesh) {
+      node.castShadow = true;
+      node.receiveShadow = true;
+    }
+  });
+  parkedCarState.mesh = car;
+  scene.add(car);
 }
 
 function createRailway() {
@@ -2228,6 +2463,80 @@ function createPersonalPlane(config) {
   }
 
   return airplane;
+}
+
+function createPersonalCar(config) {
+  const car = new THREE.Group();
+  car.scale.setScalar(config.scale ?? 1);
+
+  const bodyMaterial = new THREE.MeshStandardMaterial({
+    color: config.body ?? 0xc73a3a,
+    roughness: 0.42,
+    metalness: 0.16,
+  });
+  const accentMaterial = new THREE.MeshStandardMaterial({
+    color: config.accent ?? 0xe6ecf4,
+    roughness: 0.24,
+    metalness: 0.38,
+  });
+  const glassMaterial = new THREE.MeshStandardMaterial({
+    color: 0x99c6de,
+    emissive: 0x294a5a,
+    emissiveIntensity: 0.22,
+    roughness: 0.12,
+    metalness: 0.5,
+    transparent: true,
+    opacity: 0.88,
+  });
+  const tireMaterial = new THREE.MeshStandardMaterial({
+    color: 0x16181b,
+    roughness: 0.9,
+    metalness: 0.04,
+  });
+
+  const lowerBody = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.75, 5), bodyMaterial);
+  lowerBody.position.y = 0.65;
+  car.add(lowerBody);
+
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.95, 2.4), bodyMaterial);
+  cabin.position.set(0, 1.35, -0.25);
+  car.add(cabin);
+
+  const windshield = new THREE.Mesh(new THREE.BoxGeometry(2.02, 0.72, 0.12), glassMaterial);
+  windshield.position.set(0, 1.42, 0.92);
+  windshield.rotation.x = -0.42;
+  car.add(windshield);
+
+  const rearGlass = new THREE.Mesh(new THREE.BoxGeometry(2.02, 0.56, 0.12), glassMaterial);
+  rearGlass.position.set(0, 1.36, -1.36);
+  rearGlass.rotation.x = 0.48;
+  car.add(rearGlass);
+
+  const hood = new THREE.Mesh(new THREE.BoxGeometry(2.22, 0.16, 1.25), accentMaterial);
+  hood.position.set(0, 1.06, 1.42);
+  car.add(hood);
+
+  for (const side of [-1, 1]) {
+    const sideWindow = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.58, 1.76), glassMaterial);
+    sideWindow.position.set(side * 1.02, 1.42, -0.22);
+    car.add(sideWindow);
+  }
+
+  for (const side of [-1, 1]) {
+    for (const axleZ of [-1.45, 1.45]) {
+      const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.48, 0.48, 0.42, 18), tireMaterial);
+      wheel.rotation.z = Math.PI * 0.5;
+      wheel.position.set(side * 1.3, 0.42, axleZ);
+      car.add(wheel);
+
+      const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.46, 14), accentMaterial);
+      rim.rotation.z = Math.PI * 0.5;
+      rim.position.set(side * 1.3, 0.42, axleZ);
+      car.add(rim);
+    }
+  }
+
+  return car;
 }
 
 function createAirliner(config) {

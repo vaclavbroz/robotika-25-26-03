@@ -12,7 +12,9 @@ export class PlayerState {
     yaw,
     pitch,
     inPlane,
+    inCar,
     planeSpeed,
+    carSpeed,
     pendingPlaneCrash,
     avatar,
   }) {
@@ -28,7 +30,9 @@ export class PlayerState {
     this.yaw = yaw;
     this.pitch = pitch;
     this.inPlane = inPlane;
+    this.inCar = inCar;
     this.planeSpeed = planeSpeed;
+    this.carSpeed = carSpeed;
     this.pendingPlaneCrash = pendingPlaneCrash ?? null;
     this.avatar = {
       color: normalizeAvatarColor(avatar?.color),
@@ -50,7 +54,9 @@ export class PlayerState {
       yaw: 0,
       pitch: 0,
       inPlane: false,
+      inCar: false,
       planeSpeed: 0,
+      carSpeed: 0,
       pendingPlaneCrash: null,
       avatar: {
         color: "#3c74d4",
@@ -81,11 +87,21 @@ export class PlayerState {
   }
 
   applyInput(input) {
-    this.yaw = normalizeAngle(input.yaw);
-    this.pitch = clamp(input.pitch, -Math.PI / 2, Math.PI / 2);
     const localX = clamp(input.moveX, -1, 1);
     const localZ = clamp(input.moveZ, -1, 1);
     const normalized = normalizeStick(localX, localZ);
+    if (this.inCar) {
+      this.moveX = normalized.x;
+      this.moveZ = normalized.z;
+      this.pitch = 0;
+      if (input.jumpRequested) {
+        this.requestJump();
+      }
+      return;
+    }
+
+    this.yaw = normalizeAngle(input.yaw);
+    this.pitch = clamp(input.pitch, -Math.PI / 2, Math.PI / 2);
     const sinYaw = Math.sin(this.yaw);
     const cosYaw = Math.cos(this.yaw);
 
@@ -100,6 +116,10 @@ export class PlayerState {
   simulateTick(dtSeconds, config) {
     if (this.inPlane) {
       this.simulatePlaneTick(dtSeconds, config);
+      return;
+    }
+    if (this.inCar) {
+      this.simulateCarTick(dtSeconds, config);
       return;
     }
 
@@ -167,9 +187,45 @@ export class PlayerState {
     this.position.y = Math.max(config.planeMinAltitude, this.position.y);
     this.onGround = this.position.y <= config.planeMinAltitude + 0.05;
 
+    if (this.onGround && !isPlaneOnRunway(this.position, config)) {
+      this.triggerPlaneCrash("off-runway-landing");
+      return;
+    }
+
     this.checkPlaneCrash(config);
 
     this.enforceWorldBounds(config);
+  }
+
+  simulateCarTick(dtSeconds, config) {
+    const forwardInput = clamp(this.moveZ, -1, 1);
+    const steerInput = clamp(this.moveX, -1, 1);
+    const carMaxForwardSpeed = Math.max(0, config.carMaxForwardSpeed ?? 16);
+    const carMaxReverseSpeed = Math.max(0, config.carMaxReverseSpeed ?? 7);
+    const speedTarget =
+      forwardInput >= 0 ? forwardInput * carMaxForwardSpeed : forwardInput * carMaxReverseSpeed;
+    const response = Math.abs(speedTarget) > Math.abs(this.carSpeed)
+      ? Math.max(0, config.carAcceleration ?? 20)
+      : Math.max(0, config.carBrakeSpeed ?? 28);
+
+    this.carSpeed += (speedTarget - this.carSpeed) * Math.min(1, dtSeconds * response);
+    this.carSpeed = clamp(this.carSpeed, -carMaxReverseSpeed, carMaxForwardSpeed);
+
+    const speedRatio = Math.min(1, Math.abs(this.carSpeed) / Math.max(1, carMaxForwardSpeed));
+    this.yaw = normalizeAngle(
+      this.yaw - steerInput * (config.carTurnSpeed ?? 2.2) * Math.max(0.25, speedRatio) * dtSeconds,
+    );
+    this.pitch = 0;
+    this.velocity.x = Math.sin(this.yaw) * this.carSpeed;
+    this.velocity.z = -Math.cos(this.yaw) * this.carSpeed;
+    this.velocity.y = 0;
+    this.position.x += this.velocity.x * dtSeconds;
+    this.position.z += this.velocity.z * dtSeconds;
+    this.position.y = config.groundY;
+    this.onGround = true;
+
+    this.enforceWorldBounds(config);
+    this.enforceStaticObstacles(config);
   }
 
   enforceWorldBounds(config) {
@@ -265,14 +321,68 @@ export class PlayerState {
     }
 
     this.inPlane = true;
+    this.inCar = false;
     this.position.x = parkedPlane.x;
     this.position.z = parkedPlane.z;
-    this.position.y = config.planeMinAltitude;
+    this.position.y = config.planeMinAltitude + 0.6;
     this.velocity.x = 0;
     this.velocity.y = 0;
     this.velocity.z = 0;
     this.planeSpeed = config.planeCruiseSpeed * 0.72;
+    this.carSpeed = 0;
     return true;
+  }
+
+  toggleCarMode(config) {
+    if (this.inCar) {
+      this.inCar = false;
+      this.carSpeed = 0;
+      this.position.y = config.groundY;
+      this.velocity.x = 0;
+      this.velocity.y = 0;
+      this.velocity.z = 0;
+      this.onGround = true;
+      return true;
+    }
+
+    const parkedCar = config.parkedCar;
+    if (!parkedCar) {
+      return false;
+    }
+
+    this.inPlane = false;
+    this.inCar = true;
+    this.position.x = parkedCar.x;
+    this.position.z = parkedCar.z;
+    this.position.y = config.groundY;
+    this.yaw = normalizeAngle(Number.isFinite(parkedCar.yaw) ? parkedCar.yaw : 0);
+    this.pitch = 0;
+    this.velocity.x = 0;
+    this.velocity.y = 0;
+    this.velocity.z = 0;
+    this.planeSpeed = 0;
+    this.carSpeed = 0;
+    this.onGround = true;
+    return true;
+  }
+
+  toggleVehicleMode(config) {
+    if (this.inPlane) {
+      return this.togglePlaneMode(config);
+    }
+    if (this.inCar) {
+      return this.toggleCarMode(config);
+    }
+
+    const nearestVehicle = getNearestVehicle(this.position, config);
+    if (!nearestVehicle) {
+      return false;
+    }
+
+    if (nearestVehicle.type === "car") {
+      return this.toggleCarMode(config);
+    }
+    return this.togglePlaneMode(config);
   }
 
   checkPlaneCrash(config) {
@@ -292,21 +402,27 @@ export class PlayerState {
         continue;
       }
 
-      this.pendingPlaneCrash = {
-        x: this.position.x,
-        y: this.position.y,
-        z: this.position.z,
-        hazard: hazard.name ?? "obstacle",
-      };
-      this.inPlane = false;
-      this.planeSpeed = 0;
-      this.position.y = 0;
-      this.velocity.x = 0;
-      this.velocity.y = 0;
-      this.velocity.z = 0;
-      this.onGround = true;
+      this.triggerPlaneCrash(hazard.name ?? "obstacle");
       return;
     }
+  }
+
+  triggerPlaneCrash(hazard) {
+    this.pendingPlaneCrash = {
+      x: this.position.x,
+      y: this.position.y,
+      z: this.position.z,
+      hazard,
+    };
+    this.inPlane = false;
+    this.inCar = false;
+    this.planeSpeed = 0;
+    this.carSpeed = 0;
+    this.position.y = 0;
+    this.velocity.x = 0;
+    this.velocity.y = 0;
+    this.velocity.z = 0;
+    this.onGround = true;
   }
 
   consumePlaneCrash() {
@@ -328,6 +444,7 @@ export class PlayerState {
       yaw: this.yaw,
       pitch: this.pitch,
       inPlane: this.inPlane,
+      inCar: this.inCar,
       avatar: this.avatar,
     };
   }
@@ -398,4 +515,43 @@ function sanitizeAvatarPattern(rawPattern) {
     return rawPattern;
   }
   return "stripes";
+}
+
+function isPlaneOnRunway(position, config) {
+  const runway = config.runway;
+  if (!runway) {
+    return false;
+  }
+
+  const halfWidth = runway.width * 0.5;
+  const halfLength = runway.length * 0.5;
+  return (
+    position.x >= runway.centerX - halfWidth &&
+    position.x <= runway.centerX + halfWidth &&
+    position.z >= runway.centerZ - halfLength &&
+    position.z <= runway.centerZ + halfLength
+  );
+}
+
+function getNearestVehicle(position, config) {
+  const candidates = [];
+  if (config.parkedCar) {
+    candidates.push({ type: "car", ...config.parkedCar });
+  }
+  if (config.parkedPlane) {
+    candidates.push({ type: "plane", ...config.parkedPlane });
+  }
+
+  let nearestVehicle = null;
+  for (const vehicle of candidates) {
+    const radius = Number.isFinite(vehicle.boardingRadius) ? vehicle.boardingRadius : 12;
+    const distance = Math.hypot(position.x - vehicle.x, position.z - vehicle.z);
+    if (distance > radius) {
+      continue;
+    }
+    if (!nearestVehicle || distance < nearestVehicle.distance) {
+      nearestVehicle = { ...vehicle, distance };
+    }
+  }
+  return nearestVehicle;
 }

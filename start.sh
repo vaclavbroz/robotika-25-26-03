@@ -2,7 +2,4 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="${SCRIPT_DIR}"
-
-cd "${REPO_ROOT}"
-exec npm run dev
+exec node "${SCRIPT_DIR}/../common/dev-runner.mjs" "${SCRIPT_DIR}"

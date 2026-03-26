@@ -31,9 +31,21 @@ const SIMULATION_CONFIG = {
   playerCollisionRestitution: 0.93,
   playerCollisionIterations: 3,
   parkedPlane: {
-    x: 95,
-    z: -56,
+    x: 122,
+    z: -88,
     boardingRadius: 16,
+  },
+  parkedCar: {
+    x: 8,
+    z: 6,
+    yaw: Math.PI * 0.35,
+    boardingRadius: 12,
+  },
+  runway: {
+    centerX: 122,
+    centerZ: -88,
+    width: 24,
+    length: 118,
   },
   planeMinAltitude: 1.6,
   planeCruiseSpeed: 18,
@@ -42,6 +54,11 @@ const SIMULATION_CONFIG = {
   planeMinSpeed: 10,
   planeTurnSpeed: 1.7,
   planeClimbRate: 14,
+  carMaxForwardSpeed: 16,
+  carMaxReverseSpeed: 7,
+  carAcceleration: 14,
+  carBrakeSpeed: 20,
+  carTurnSpeed: 2.4,
   planeCrashHazards: [
     { name: "airport-terminal", minX: 67, maxX: 91, minZ: -83, maxZ: -61, height: 14 },
     { name: "station-building", minX: -46, maxX: -22, minZ: 132, maxZ: 142, height: 14 },
@@ -76,12 +93,13 @@ const SIMULATION_CONFIG = {
   ],
 };
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const PORT = Number(process.env.PORT || 8010);
+const PORT = Number(process.env.PORT || 9003);
 const HOST = process.env.HOST || "0.0.0.0";
-const CLIENT_PORT = Number(process.env.CLIENT_PORT || 8000);
+const CLIENT_PORT = Number(process.env.CLIENT_PORT || 8003);
 const DEV_AUTO_RESTART = process.env.DEV_AUTO_RESTART === "1";
 const DEV_RESTART_NOTICE_MS = Number(process.env.DEV_RESTART_NOTICE_MS || 1400);
 const DEV_RESTART_SHUTDOWN_GRACE_MS = 250;
+const QUIET_STARTUP_LOGS = process.env.QUIET_STARTUP_LOGS === "1";
 
 const world = new WorldState();
 
@@ -124,9 +142,11 @@ server.on("upgrade", (req, socket) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[server] websocket gateway listening on ws://${HOST}:${PORT} (${TICK_HZ} Hz sim)`);
-  const clientHost = resolveClientHostForStartupUrl();
-  console.log(`[server] client url http://${clientHost}:${CLIENT_PORT}`);
+  if (!QUIET_STARTUP_LOGS) {
+    console.log(`[server] websocket gateway listening on ws://${HOST}:${PORT} (${TICK_HZ} Hz sim)`);
+    const clientHost = resolveClientHostForStartupUrl();
+    console.log(`[server] client url http://${clientHost}:${CLIENT_PORT}`);
+  }
 });
 
 const simulationTimer = setInterval(() => {
@@ -388,10 +408,10 @@ function onFrame(connection, opcode, payload) {
     return;
   }
 
-  if (message.type === "toggle_plane") {
+  if (message.type === "toggle_plane" || message.type === "toggle_vehicle") {
     const player = world.getPlayer(connection.playerId);
     if (player) {
-      player.togglePlaneMode(SIMULATION_CONFIG);
+      player.toggleVehicleMode(SIMULATION_CONFIG);
     }
   }
 }
@@ -544,7 +564,7 @@ function resolveClientHostForStartupUrl() {
 
 function readExternalIpFromSetupFile() {
   const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-  const defaultPath = path.resolve(scriptDir, "../../../../setup/.wsl_external_ip");
+  const defaultPath = path.resolve(scriptDir, "../../../../.ip");
   const configuredPath = process.env.EXTERNAL_IP_FILE || defaultPath;
 
   if (!existsSync(configuredPath)) {

@@ -20,16 +20,12 @@ You should see prefixed logs in the same terminal:
 
 ## Dev Ports Configuration
 
-Ports are configured in:
-
-```bash
-scripts/dev-ports.json
-```
+Ports are derived from the team folder name.
 
 Defaults:
 
 - app/client: `8003`
-- websocket server: `8013`
+- websocket server: `9003`
 
 ## Verify Server Connect/Disconnect Logs
 
@@ -38,7 +34,7 @@ Open the client URL shown in `[client]` logs (default `http://localhost:8003/`) 
 You can also use this temporary smoke client in another terminal while stack is running:
 
 ```bash
-node -e 'const ws=new WebSocket("ws://127.0.0.1:8013");ws.onmessage=(e)=>{console.log(e.data);setTimeout(()=>ws.close(),1000);};'
+node -e 'const ws=new WebSocket("ws://127.0.0.1:9003");ws.onmessage=(e)=>{console.log(e.data);setTimeout(()=>ws.close(),1000);};'
 ```
 
 Expected server logs:

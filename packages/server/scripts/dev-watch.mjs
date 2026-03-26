@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.resolve(scriptDir, "..");
 const restartDebounceMs = Number.parseInt(process.env.SERVER_RESTART_DEBOUNCE_MS || "1400", 10);
+const QUIET_STARTUP_LOGS = process.env.QUIET_STARTUP_LOGS === "1";
 const watchRoots = [path.join(serverRoot, "src")];
 
 let child = null;
@@ -42,7 +43,9 @@ function startServer() {
 
     if (restartPending) {
       restartPending = false;
-      console.log(`[dev-watch] restarting server after ${restartReason}`);
+      if (!QUIET_STARTUP_LOGS) {
+        console.log(`[dev-watch] restarting server after ${restartReason}`);
+      }
       startServer();
       return;
     }
@@ -59,7 +62,9 @@ function scheduleRestart(reason) {
   }
 
   restartReason = reason;
-  console.log(`[dev-watch] change detected, restarting in ${restartDebounceMs}ms`);
+  if (!QUIET_STARTUP_LOGS) {
+    console.log(`[dev-watch] change detected, restarting in ${restartDebounceMs}ms`);
+  }
   clearTimeout(restartTimer);
   restartTimer = setTimeout(() => {
     restartTimer = null;

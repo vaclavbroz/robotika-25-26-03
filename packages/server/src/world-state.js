@@ -88,6 +88,20 @@ export class WorldState {
             continue;
           }
 
+          if (a.inPlane && b.inPlane) {
+            a.triggerPlaneCrash("midair-collision");
+            b.triggerPlaneCrash("midair-collision");
+            const crashA = a.consumePlaneCrash?.();
+            const crashB = b.consumePlaneCrash?.();
+            if (crashA) {
+              this.recentPlaneCrashes.push(crashA);
+            }
+            if (crashB) {
+              this.recentPlaneCrashes.push(crashB);
+            }
+            continue;
+          }
+
           let nx;
           let ny;
           let nz;

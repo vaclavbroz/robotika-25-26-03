@@ -413,6 +413,14 @@ function onFrame(connection, opcode, payload) {
     if (player) {
       player.toggleVehicleMode(SIMULATION_CONFIG);
     }
+    return;
+  }
+
+  if (message.type === "report_plane_collision") {
+    const player = world.getPlayer(connection.playerId);
+    if (player?.inPlane) {
+      player.triggerPlaneCrash("air-traffic-collision");
+    }
   }
 }
 

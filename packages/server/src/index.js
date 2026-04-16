@@ -54,11 +54,11 @@ const SIMULATION_CONFIG = {
   planeMinSpeed: 10,
   planeTurnSpeed: 1.7,
   planeClimbRate: 14,
-  carMaxForwardSpeed: 16,
-  carMaxReverseSpeed: 7,
-  carAcceleration: 14,
-  carBrakeSpeed: 20,
-  carTurnSpeed: 2.4,
+  carMaxForwardSpeed: 24,
+  carMaxReverseSpeed: 9,
+  carAcceleration: 18,
+  carBrakeSpeed: 24,
+  carTurnSpeed: 2.7,
   planeCrashHazards: [
     { name: "airport-terminal", minX: 67, maxX: 91, minZ: -83, maxZ: -61, height: 14 },
     { name: "station-building", minX: -46, maxX: -22, minZ: 132, maxZ: 142, height: 14 },
@@ -207,7 +207,7 @@ function initPlayerSession(connection) {
   socketsByPlayerId.set(playerId, connection);
   connection.playerId = playerId;
 
-  const snapshot = world.createSnapshot();
+  const snapshot = createReplicationSnapshot();
 
   connection.sendJson({
     type: "welcome",
@@ -251,7 +251,7 @@ function cleanupPlayerSession(connection) {
 
 function broadcastReplicationUpdate() {
   if (world.tick % SNAPSHOT_INTERVAL_TICKS === 0) {
-    const snapshot = world.createSnapshot();
+    const snapshot = createReplicationSnapshot();
     for (const state of snapshot.players) {
       if (!state || typeof state.playerId !== "string") {
         continue;
@@ -262,6 +262,7 @@ function broadcastReplicationUpdate() {
       type: "snapshot",
       tick: snapshot.tick,
       players: snapshot.players,
+      parkedCar: snapshot.parkedCar,
     });
     return;
   }
@@ -284,7 +285,30 @@ function broadcastReplicationUpdate() {
     type: "delta",
     tick: world.tick,
     players: changedPlayers,
+    parkedCar: serializeParkedCar(),
   });
+}
+
+function createReplicationSnapshot() {
+  const snapshot = world.createSnapshot();
+  return {
+    ...snapshot,
+    parkedCar: serializeParkedCar(),
+  };
+}
+
+function serializeParkedCar() {
+  const parkedCar = SIMULATION_CONFIG.parkedCar;
+  if (!parkedCar) {
+    return null;
+  }
+
+  return {
+    x: Number(parkedCar.x) || 0,
+    z: Number(parkedCar.z) || 0,
+    yaw: Number.isFinite(parkedCar.yaw) ? parkedCar.yaw : 0,
+    boardingRadius: Number(parkedCar.boardingRadius) || 12,
+  };
 }
 
 function broadcastCollisionEvents() {

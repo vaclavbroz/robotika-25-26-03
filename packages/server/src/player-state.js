@@ -335,13 +335,28 @@ export class PlayerState {
 
   toggleCarMode(config) {
     if (this.inCar) {
+      const exitYaw = normalizeAngle(this.yaw);
+      const exitOffset = 2.2;
+      const exitSideX = Math.cos(exitYaw) * exitOffset;
+      const exitSideZ = Math.sin(exitYaw) * exitOffset;
       this.inCar = false;
       this.carSpeed = 0;
+      if (config.parkedCar) {
+        config.parkedCar.x = this.position.x;
+        config.parkedCar.z = this.position.z;
+        config.parkedCar.yaw = exitYaw;
+      }
+      this.position.x += exitSideX;
+      this.position.z += exitSideZ;
+      this.yaw = exitYaw;
+      this.pitch = 0;
       this.position.y = config.groundY;
       this.velocity.x = 0;
       this.velocity.y = 0;
       this.velocity.z = 0;
       this.onGround = true;
+      this.enforceWorldBounds(config);
+      this.enforceStaticObstacles(config);
       return true;
     }
 

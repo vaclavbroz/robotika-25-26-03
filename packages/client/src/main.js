@@ -49,10 +49,18 @@ const PARKED_CAR_YAW = Math.PI * 0.35;
 const DAY_DURATION_SECONDS = 5 * 60;
 const NIGHT_DURATION_SECONDS = 3 * 60;
 const DAY_NIGHT_CYCLE_SECONDS = DAY_DURATION_SECONDS + NIGHT_DURATION_SECONDS;
+const RAIN_CYCLE_SECONDS = 10 * 60;
+const RAIN_DURATION_SECONDS = 2 * 60;
+const SNOW_CYCLE_SECONDS = 13 * 60;
+const SNOW_DURATION_SECONDS = 3 * 60;
+const SNOW_COVER_HOLD_SECONDS = 5 * 60;
 const DAY_SKY_COLOR = new THREE.Color(0x87c9ff);
 const NIGHT_SKY_COLOR = new THREE.Color(0x07111d);
 const DAY_FOG_COLOR = new THREE.Color(0x87c9ff);
 const NIGHT_FOG_COLOR = new THREE.Color(0x09131f);
+const PRECIPITATION_SKY_TINT = new THREE.Color(0xc6d6e2);
+const PRECIPITATION_FOG_TINT = new THREE.Color(0xc0cbd6);
+const SNOW_COVER_TINT = new THREE.Color(0xe6edf2);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87c9ff);
@@ -88,6 +96,10 @@ scene.add(sun);
 const bounce = new THREE.DirectionalLight(0xbfd2ff, 0.28);
 bounce.position.set(-120, 80, -130);
 scene.add(bounce);
+
+const moonLight = new THREE.DirectionalLight(0xcfe3ff, 0);
+moonLight.position.set(-180, 210, -140);
+scene.add(moonLight);
 
 const terrainGeometry = new THREE.PlaneGeometry(
   WORLD_SIZE,
@@ -128,6 +140,23 @@ const skyDome = new THREE.Mesh(
   }),
 );
 scene.add(skyDome);
+
+const moon = new THREE.Mesh(
+  new THREE.SphereGeometry(18, 24, 24),
+  new THREE.MeshBasicMaterial({
+    color: 0xf4f7ff,
+    transparent: true,
+    opacity: 0,
+  }),
+);
+moon.position.set(-260, 250, -380);
+scene.add(moon);
+
+const weather = createWeatherState();
+scene.add(weather.overcast);
+scene.add(weather.clouds);
+scene.add(weather.rain.points);
+scene.add(weather.snow.points);
 
 const keys = {
   forward: false,
@@ -191,16 +220,22 @@ const runwayApproachLightGlows = [];
 const runwayApproachSpotlights = [];
 const railwayTraffic = [];
 const activeExplosions = [];
+const activeBurningWrecks = [];
 const activeTouchdownSmokes = [];
+const activeAircraftLights = [];
 const parkedPlaneState = {
   mesh: null,
 };
 const parkedCarState = {
   mesh: null,
+  x: PARKED_CAR_POSITION.x,
+  z: PARKED_CAR_POSITION.z,
+  yaw: PARKED_CAR_YAW,
 };
 const rcPlaneState = {
   active: false,
   mesh: null,
+  selectedType: "propeller",
   position: new THREE.Vector3(),
   velocity: new THREE.Vector3(),
   yaw: 0,
@@ -397,8 +432,11 @@ function animate() {
   updateAirportTraffic(clock.elapsedTime);
   updateRailwayTraffic(clock.elapsedTime);
   updateExplosions(dt);
+  updateBurningWrecks(dt);
   updateTouchdownSmokes(dt);
+  updateWeatherSystem(clock.elapsedTime, dt);
   updateDayNightCycle(clock.elapsedTime);
+  updateAircraftBeacons(clock.elapsedTime);
 
   lookDirection.set(
     Math.sin(player.courseYaw) * Math.cos(player.pitch),
@@ -409,6 +447,15 @@ function animate() {
   const localPlane = net.playerId ? net.playerPlanesById.get(net.playerId) : null;
   const localCar = net.playerId ? net.playerCarsById.get(net.playerId) : null;
   updateRcPlane(dt);
+  if (parkedPlaneState.mesh) {
+    setAircraftControlledLights(parkedPlaneState.mesh, false);
+  }
+  if (localPlane) {
+    setAircraftControlledLights(localPlane, localState?.inPlane === true);
+  }
+  if (rcPlaneState.mesh) {
+    setAircraftControlledLights(rcPlaneState.mesh, rcPlaneState.active === true);
+  }
   detectLocalPlaneTrafficCollision(localState, localPlane, clock.elapsedTime);
   updatePlaneWarning(localState);
   if (rcPlaneState.active && rcPlaneState.mesh) {
@@ -544,6 +591,7 @@ function onServerMessage(message) {
       removePlayerCar(playerId);
     }
 
+    syncParkedCarState(message.snapshot?.parkedCar);
     const snapshotPlayers = Array.isArray(message.snapshot?.players) ? message.snapshot.players : [];
     applyServerPlayerStates(snapshotPlayers, message.snapshot?.tick, { replaceAll: true });
     return;
@@ -566,12 +614,14 @@ function onServerMessage(message) {
   }
 
   if (message.type === "snapshot") {
+    syncParkedCarState(message.parkedCar);
     const nextPlayers = Array.isArray(message.players) ? message.players : [];
     applyServerPlayerStates(nextPlayers, message.tick, { replaceAll: true });
     return;
   }
 
   if (message.type === "delta") {
+    syncParkedCarState(message.parkedCar);
     const nextPlayers = Array.isArray(message.players) ? message.players : [];
     applyServerPlayerStates(nextPlayers, message.tick);
     return;
@@ -752,6 +802,7 @@ function syncRenderedPlayersFromServer() {
         plane.rotation.set(0, -(Number(state?.yaw) || 0), 0, "YXZ");
         plane.rotateY(Math.PI / 2);
         plane.rotateZ((Number(state?.pitch) || 0) * 0.35);
+        setAircraftGearDeployed(plane, state?.onGround === true || y <= 5.5);
         maybeTriggerPlaneTouchdownSmoke(playerId, state);
       } else {
         removePlayerPlane(playerId);
@@ -783,6 +834,7 @@ function syncRenderedPlayersFromServer() {
       plane.rotation.set(0, -(Number(state?.yaw) || 0), 0, "YXZ");
       plane.rotateY(Math.PI / 2);
       plane.rotateZ((Number(state?.pitch) || 0) * 0.35);
+      setAircraftGearDeployed(plane, state?.onGround === true || y <= 5.5);
       maybeTriggerPlaneTouchdownSmoke(playerId, state);
       continue;
     }
@@ -840,6 +892,7 @@ function getOrCreatePlayerPlane(playerId, avatar) {
     body: normalizeAvatarColor(avatar?.color),
     accent: 0x1f2f3b,
     scale: 0.44,
+    controlledLights: playerId === net.playerId,
   });
   scene.add(plane);
   net.playerPlanesById.set(playerId, plane);
@@ -924,7 +977,7 @@ function updateParkedPlaneAvailability(authoritative, x, z) {
 
   if (!localInPlane && !localInCar) {
     const planeDistance = Math.hypot(x - PARKED_PLANE_POSITION.x, z - PARKED_PLANE_POSITION.z);
-    const carDistance = Math.hypot(x - PARKED_CAR_POSITION.x, z - PARKED_CAR_POSITION.z);
+    const carDistance = Math.hypot(x - parkedCarState.x, z - parkedCarState.z);
     if (carDistance <= 12 && carDistance < planeDistance) {
       setHelpStatus("Press F to board the car and drive.", "Car Ready");
     } else if (planeDistance <= 18) {
@@ -1001,24 +1054,49 @@ function togglePlaneBoarding() {
 
 function toggleRcPlane() {
   if (rcPlaneState.active) {
-    rcPlaneState.active = false;
-    rcPlaneState.throttleUp = false;
-    rcPlaneState.throttleDown = false;
-    rcPlaneState.wasGrounded = false;
-    if (rcPlaneState.mesh) {
-      rcPlaneState.mesh.visible = false;
-    }
-    if (rcControllerState.mesh) {
-      rcControllerState.mesh.visible = false;
-    }
-    setHelpStatus("RC plane parked.", "RC Off");
+    parkRcPlane();
     return;
   }
 
-  if (!rcPlaneState.mesh) {
-    rcPlaneState.mesh = createRcPlane();
-    scene.add(rcPlaneState.mesh);
+  startRcPlane(rcPlaneState.selectedType);
+}
+
+function parkRcPlane() {
+  rcPlaneState.active = false;
+  rcPlaneState.throttleUp = false;
+  rcPlaneState.throttleDown = false;
+  rcPlaneState.wasGrounded = false;
+  if (rcPlaneState.mesh) {
+    rcPlaneState.mesh.visible = false;
   }
+  if (rcControllerState.mesh) {
+    rcControllerState.mesh.visible = false;
+  }
+  setHelpStatus("RC plane parked.", "RC Off");
+}
+
+function startRcPlane(type) {
+  if (rcPlaneState.mesh) {
+    scene.remove(rcPlaneState.mesh);
+    rcPlaneState.mesh.traverse((node) => {
+      if (node.geometry) {
+        node.geometry.dispose();
+      }
+      if (node.material) {
+        if (Array.isArray(node.material)) {
+          for (const material of node.material) {
+            material.dispose();
+          }
+        } else {
+          node.material.dispose();
+        }
+      }
+    });
+  }
+
+  rcPlaneState.selectedType = type;
+  rcPlaneState.mesh = createRcPlane(type);
+  scene.add(rcPlaneState.mesh);
   if (!rcControllerState.mesh) {
     rcControllerState.mesh = createRcController();
     camera.add(rcControllerState.mesh);
@@ -1038,7 +1116,12 @@ function toggleRcPlane() {
   rcPlaneState.mesh.visible = true;
   rcControllerState.mesh.visible = true;
   rcPlaneState.active = true;
-  setHelpStatus("RC plane active. Use mouse and WASD. Press V to park it.", "RC Ready");
+  const labelsByType = {
+    fighter: "RC stihacka",
+    airliner: "RC dopravni",
+    propeller: "RC vrtulak",
+  };
+  setHelpStatus(`${labelsByType[type] ?? "RC plane"} active. Use mouse and WASD. Press V to park it.`, "RC Ready");
 }
 
 function updateRcPlane(dt) {
@@ -1086,14 +1169,31 @@ function updateRcPlane(dt) {
   rcPlaneState.mesh.rotation.set(0, -rcPlaneState.yaw, 0, "YXZ");
   rcPlaneState.mesh.rotateY(Math.PI / 2);
   rcPlaneState.mesh.rotateZ(rcPlaneState.pitch * 0.45 - rollInput * 0.2);
+  setAircraftGearDeployed(rcPlaneState.mesh, grounded || (rcPlaneState.position.y - terrainY) <= 5.5);
 }
 
-function createRcPlane() {
-  const plane = createPersonalPlane({
-    body: 0xf5f06c,
-    accent: 0x1d2430,
-    scale: 0.16,
-  });
+function createRcPlane(type = "fighter") {
+  let plane;
+  if (type === "airliner") {
+    plane = createAirliner({
+      body: 0xe7edf6,
+      accent: 0x2a5f94,
+    });
+    plane.scale.setScalar(0.16);
+  } else if (type === "propeller") {
+    plane = createPersonalPlane({
+      body: 0xf5f06c,
+      accent: 0x1d2430,
+      scale: 0.16,
+      controlledLights: true,
+    });
+  } else {
+    plane = createConcorde({
+      body: 0xd7dde4,
+      accent: 0xc83a32,
+      scale: 0.15,
+    });
+  }
   plane.visible = false;
   return plane;
 }
@@ -1320,11 +1420,11 @@ function handlePlaneCrashes(rawCrashes) {
     if (!crash || typeof crash !== "object") {
       continue;
     }
-    spawnExplosion(
-      Number(crash.x) || 0,
-      Number(crash.y) || 0,
-      Number(crash.z) || 0,
-    );
+    const crashX = Number(crash.x) || 0;
+    const crashY = Number(crash.y) || 0;
+    const crashZ = Number(crash.z) || 0;
+    spawnExplosion(crashX, crashY, crashZ);
+    spawnBurningWreck(crashX, crashY, crashZ);
   }
 }
 
@@ -1383,6 +1483,108 @@ function updateExplosions(dt) {
         child.material.opacity = Math.max(0, 1 - t * 1.2);
       }
     }
+  }
+}
+
+function spawnBurningWreck(x, y, z) {
+  const root = new THREE.Group();
+  const flameMaterial = new THREE.MeshBasicMaterial({
+    color: 0xff8e2b,
+    transparent: true,
+    opacity: 0.88,
+  });
+  const smokeMaterial = new THREE.SpriteMaterial({
+    map: touchdownSmokeTexture,
+    transparent: true,
+    depthWrite: false,
+    opacity: 0.58,
+    color: 0x3e4348,
+  });
+
+  for (let i = 0; i < 4; i += 1) {
+    const flame = new THREE.Mesh(
+      new THREE.SphereGeometry(0.7 + Math.random() * 0.35, 10, 8),
+      flameMaterial.clone(),
+    );
+    flame.position.set(
+      (Math.random() - 0.5) * 2.1,
+      0.6 + Math.random() * 1.1,
+      (Math.random() - 0.5) * 2.1,
+    );
+    flame.userData.baseScale = 0.8 + Math.random() * 0.45;
+    flame.userData.phase = Math.random() * Math.PI * 2;
+    root.add(flame);
+  }
+
+  for (let i = 0; i < 6; i += 1) {
+    const smoke = new THREE.Sprite(smokeMaterial.clone());
+    smoke.position.set(
+      (Math.random() - 0.5) * 2.4,
+      0.8 + Math.random() * 0.6,
+      (Math.random() - 0.5) * 2.4,
+    );
+    smoke.scale.setScalar(1.3 + Math.random() * 1.1);
+    smoke.userData.velocity = new THREE.Vector3(
+      (Math.random() - 0.5) * 0.25,
+      0.7 + Math.random() * 0.55,
+      (Math.random() - 0.5) * 0.25,
+    );
+    smoke.userData.baseScale = smoke.scale.x;
+    root.add(smoke);
+  }
+
+  root.position.set(x, y + 0.1, z);
+  scene.add(root);
+  activeBurningWrecks.push({
+    root,
+    age: 0,
+    duration: 10,
+  });
+}
+
+function updateBurningWrecks(dt) {
+  for (let i = activeBurningWrecks.length - 1; i >= 0; i -= 1) {
+    const wreck = activeBurningWrecks[i];
+    wreck.age += dt;
+    const t = wreck.age / wreck.duration;
+    if (t >= 1) {
+      scene.remove(wreck.root);
+      wreck.root.traverse((node) => {
+        if (node.geometry) {
+          node.geometry.dispose();
+        }
+        if (node.material) {
+          node.material.dispose();
+        }
+      });
+      activeBurningWrecks.splice(i, 1);
+      continue;
+    }
+
+    const fade = Math.max(0, 1 - t);
+    wreck.root.traverse((node) => {
+      if (node instanceof THREE.Mesh && node.material instanceof THREE.MeshBasicMaterial) {
+        const flicker = 0.8 + 0.25 * Math.sin((wreck.age * 10) + (node.userData.phase || 0));
+        const scale = (node.userData.baseScale || 1) * flicker;
+        node.scale.setScalar(scale);
+        node.material.opacity = Math.max(0, 0.82 * fade);
+      } else if (node instanceof THREE.Sprite && node.material instanceof THREE.SpriteMaterial) {
+        const velocity = node.userData.velocity;
+        if (velocity) {
+          node.position.addScaledVector(velocity, dt);
+        }
+        node.scale.multiplyScalar(1 + dt * (0.42 + t * 0.9));
+        if (node.position.y > 8.5) {
+          node.position.set(
+            (Math.random() - 0.5) * 2.4,
+            0.8 + Math.random() * 0.6,
+            (Math.random() - 0.5) * 2.4,
+          );
+          node.scale.setScalar(node.userData.baseScale || 1.5);
+        }
+        node.material.opacity = Math.max(0, 0.52 * fade);
+      }
+    });
   }
 }
 
@@ -1500,6 +1702,12 @@ function detectLocalPlaneTrafficCollision(localState, localPlane, elapsedTime) {
 
     spawnExplosion(localPlane.position.x, localPlane.position.y, localPlane.position.z);
     spawnExplosion(
+      trafficPlane.mesh.position.x,
+      trafficPlane.mesh.position.y,
+      trafficPlane.mesh.position.z,
+    );
+    spawnBurningWreck(localPlane.position.x, localPlane.position.y, localPlane.position.z);
+    spawnBurningWreck(
       trafficPlane.mesh.position.x,
       trafficPlane.mesh.position.y,
       trafficPlane.mesh.position.z,
@@ -2306,9 +2514,11 @@ function createAirport() {
     body: 0xf5f6f8,
     accent: 0x2068a0,
     scale: 0.52,
+    controlledLights: true,
   });
   parkedPlaneState.mesh.position.set(PARKED_PLANE_POSITION.x, runwayY + 0.1, PARKED_PLANE_POSITION.z);
   parkedPlaneState.mesh.rotation.y = Math.PI * 0.5;
+  setAircraftGearDeployed(parkedPlaneState.mesh, true);
   airport.add(parkedPlaneState.mesh);
 
   for (let side = -1; side <= 1; side += 2) {
@@ -2512,7 +2722,7 @@ function createModelAirfield() {
     airfield.add(windsock);
   }
 
-  const parkedRc = createRcPlane();
+  const parkedRc = createRcPlane("propeller");
   parkedRc.visible = true;
   parkedRc.position.set(prepAreaCenter.x + 3.8, runwayY + 0.06, prepAreaCenter.z + 1.4);
   parkedRc.rotation.y = Math.PI * 0.18;
@@ -2531,6 +2741,11 @@ function updateDayNightCycle(elapsedTime) {
 
   scene.background.copy(DAY_SKY_COLOR).lerp(NIGHT_SKY_COLOR, blend);
   scene.fog.color.copy(DAY_FOG_COLOR).lerp(NIGHT_FOG_COLOR, blend);
+  const precipitationBlend = weather.precipitation === "clear" ? 0 : weather.precipitation === "sleet" ? 0.34 : 0.26;
+  const cloudBlend = weather.precipitation === "clear" ? 0 : weather.precipitation === "sleet" ? 0.82 : 0.68;
+  const overcastBlend = weather.precipitation === "clear" ? 0 : weather.precipitation === "sleet" ? 0.86 : 0.72;
+  scene.background.lerp(PRECIPITATION_SKY_TINT, precipitationBlend);
+  scene.fog.color.lerp(PRECIPITATION_FOG_TINT, precipitationBlend * 1.35);
   skyDome.material.color.copy(scene.background);
   ambient.intensity = THREE.MathUtils.lerp(0.62, 0.12, blend);
   ambient.color.setRGB(
@@ -2545,11 +2760,37 @@ function updateDayNightCycle(elapsedTime) {
   );
   sun.intensity = THREE.MathUtils.lerp(1.1, 0.08, blend);
   bounce.intensity = THREE.MathUtils.lerp(0.28, 0.04, blend);
+  moonLight.intensity = isNight ? THREE.MathUtils.lerp(0.08, 0.42, smoothstep(phase)) : 0;
+  moon.visible = isNight;
+  moon.material.opacity = isNight ? THREE.MathUtils.lerp(0.18, 0.92, smoothstep(phase)) * (1 - overcastBlend * 0.9) : 0;
+  weather.overcast.visible = overcastBlend > 0.01;
+  if (weather.overcast.material instanceof THREE.MeshBasicMaterial) {
+    weather.overcast.material.opacity = overcastBlend;
+    weather.overcast.material.color.setRGB(
+      THREE.MathUtils.lerp(0.92, 0.62, blend),
+      THREE.MathUtils.lerp(0.95, 0.66, blend),
+      THREE.MathUtils.lerp(0.99, 0.74, blend),
+    );
+  }
+  weather.clouds.visible = cloudBlend > 0.01;
+  weather.clouds.traverse((node) => {
+    if (!(node instanceof THREE.Mesh) || !(node.material instanceof THREE.MeshStandardMaterial)) {
+      return;
+    }
+    node.material.opacity = cloudBlend;
+    node.material.color.setRGB(
+      THREE.MathUtils.lerp(0.95, 0.74, blend),
+      THREE.MathUtils.lerp(0.97, 0.78, blend),
+      THREE.MathUtils.lerp(1.0, 0.84, blend),
+    );
+  });
   terrainMaterial.color.setRGB(
     THREE.MathUtils.lerp(0.44, 0.11, blend),
     THREE.MathUtils.lerp(0.56, 0.16, blend),
     THREE.MathUtils.lerp(0.35, 0.2, blend),
   );
+  terrainMaterial.color.lerp(SNOW_COVER_TINT, weather.snowCover * 0.78);
+  terrainMaterial.roughness = THREE.MathUtils.lerp(0.88, 0.96, weather.snowCover);
 
   const nightBlend = isNight ? smoothstep(phase) : 0;
   const runwayGlow = isNight ? THREE.MathUtils.lerp(0.6, 2.8, nightBlend) : 0;
@@ -2601,6 +2842,207 @@ function updateDayNightCycle(elapsedTime) {
   }
 }
 
+function createWeatherState() {
+  return {
+    precipitation: "clear",
+    snowCover: 0,
+    snowCoverHoldUntil: 0,
+    overcast: createOvercastDome(),
+    clouds: createCloudLayer(),
+    rain: createPrecipitationSystem({
+      count: 440,
+      texture: createPrecipitationTexture("rain"),
+      color: 0xb8d5ea,
+      size: 0.16,
+      opacity: 0.7,
+      radius: 34,
+      height: 30,
+      minGroundOffset: 1.6,
+      speedMin: 24,
+      speedMax: 38,
+      driftAmount: 1.8,
+    }),
+    snow: createPrecipitationSystem({
+      count: 240,
+      texture: createPrecipitationTexture("snow"),
+      color: 0xf5fbff,
+      size: 0.42,
+      opacity: 0.92,
+      radius: 34,
+      height: 28,
+      minGroundOffset: 1.2,
+      speedMin: 3.4,
+      speedMax: 6.2,
+      driftAmount: 0.75,
+    }),
+  };
+}
+
+function createOvercastDome() {
+  return new THREE.Mesh(
+    new THREE.SphereGeometry(860, 32, 16),
+    new THREE.MeshBasicMaterial({
+      color: 0xc8d2dc,
+      side: THREE.BackSide,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    }),
+  );
+}
+
+function createCloudLayer() {
+  const clouds = new THREE.Group();
+  clouds.visible = false;
+
+  const cloudMaterial = new THREE.MeshStandardMaterial({
+    color: 0xf2f6fb,
+    roughness: 0.96,
+    metalness: 0,
+    transparent: true,
+    opacity: 0,
+  });
+
+  const cloudLayouts = [
+    { x: -170, y: 114, z: -120, scale: 1.3 },
+    { x: -58, y: 126, z: 18, scale: 1.1 },
+    { x: 82, y: 118, z: -72, scale: 1.25 },
+    { x: 168, y: 122, z: 96, scale: 1.15 },
+    { x: 28, y: 132, z: 162, scale: 1.35 },
+    { x: -138, y: 120, z: 142, scale: 1.05 },
+  ];
+
+  for (const layout of cloudLayouts) {
+    const puff = new THREE.Group();
+    const offsets = [
+      { x: -9, y: 0, z: 0, r: 12 },
+      { x: 0, y: 3, z: -2, r: 15 },
+      { x: 10, y: 1, z: 2, r: 11 },
+      { x: 18, y: -1, z: -1, r: 8 },
+    ];
+
+    for (const offset of offsets) {
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(offset.r, 18, 16),
+        cloudMaterial.clone(),
+      );
+      mesh.position.set(offset.x, offset.y, offset.z);
+      mesh.scale.set(1.35, 0.68, 1);
+      puff.add(mesh);
+    }
+
+    puff.position.set(layout.x, layout.y, layout.z);
+    puff.scale.setScalar(layout.scale);
+    clouds.add(puff);
+  }
+
+  return clouds;
+}
+
+function updateWeatherSystem(elapsedTime, dt) {
+  const raining = (elapsedTime % RAIN_CYCLE_SECONDS) < RAIN_DURATION_SECONDS;
+  const snowing = (elapsedTime % SNOW_CYCLE_SECONDS) < SNOW_DURATION_SECONDS;
+  weather.precipitation = raining && snowing ? "sleet" : raining ? "rain" : snowing ? "snow" : "clear";
+
+  if (snowing) {
+    weather.snowCover = Math.min(1, weather.snowCover + dt / 42);
+    weather.snowCoverHoldUntil = elapsedTime + SNOW_COVER_HOLD_SECONDS;
+  } else if (elapsedTime > weather.snowCoverHoldUntil) {
+    weather.snowCover = Math.max(0, weather.snowCover - dt / 80);
+  }
+
+  const anchor = player.position;
+  updatePrecipitationSystem(weather.rain, dt, anchor, raining);
+  updatePrecipitationSystem(weather.snow, dt, anchor, snowing);
+}
+
+function createPrecipitationSystem(config) {
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(config.count * 3);
+  const speeds = new Float32Array(config.count);
+  const drift = new Float32Array(config.count * 2);
+  const material = new THREE.PointsMaterial({
+    map: config.texture,
+    color: config.color,
+    size: config.size,
+    transparent: true,
+    opacity: config.opacity,
+    depthWrite: false,
+    sizeAttenuation: true,
+  });
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  points.visible = false;
+
+  for (let i = 0; i < config.count; i += 1) {
+    positions[(i * 3) + 0] = 0;
+    positions[(i * 3) + 1] = -1000;
+    positions[(i * 3) + 2] = 0;
+    speeds[i] = THREE.MathUtils.lerp(config.speedMin, config.speedMax, Math.random());
+    drift[(i * 2) + 0] = (Math.random() - 0.5) * config.driftAmount;
+    drift[(i * 2) + 1] = (Math.random() - 0.5) * config.driftAmount;
+  }
+
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+
+  return {
+    points,
+    positions,
+    speeds,
+    drift,
+    count: config.count,
+    radius: config.radius,
+    height: config.height,
+    minGroundOffset: config.minGroundOffset,
+  };
+}
+
+function updatePrecipitationSystem(system, dt, anchor, active) {
+  system.points.visible = active;
+  if (!active) {
+    return;
+  }
+
+  const positions = system.positions;
+  for (let i = 0; i < system.count; i += 1) {
+    const index = i * 3;
+    let x = positions[index + 0];
+    let y = positions[index + 1];
+    let z = positions[index + 2];
+    const groundY = terrainHeight(x, z);
+
+    if (y < groundY + system.minGroundOffset || y > anchor.y + system.height + 2 || Number.isNaN(y)) {
+      respawnPrecipitationParticle(system, i, anchor);
+      continue;
+    }
+
+    x += system.drift[(i * 2) + 0] * dt;
+    y -= system.speeds[i] * dt;
+    z += system.drift[(i * 2) + 1] * dt;
+
+    if (Math.abs(x - anchor.x) > system.radius || Math.abs(z - anchor.z) > system.radius) {
+      respawnPrecipitationParticle(system, i, anchor);
+      continue;
+    }
+
+    positions[index + 0] = x;
+    positions[index + 1] = y;
+    positions[index + 2] = z;
+  }
+
+  system.points.geometry.attributes.position.needsUpdate = true;
+}
+
+function respawnPrecipitationParticle(system, particleIndex, anchor) {
+  const index = particleIndex * 3;
+  const x = anchor.x + (Math.random() - 0.5) * system.radius * 2;
+  const z = anchor.z + (Math.random() - 0.5) * system.radius * 2;
+  const top = anchor.y + Math.random() * system.height + 6;
+  system.positions[index + 0] = x;
+  system.positions[index + 1] = top;
+  system.positions[index + 2] = z;
+}
+
 function createRunwayLightGlow(color) {
   const canvas = document.createElement("canvas");
   canvas.width = 128;
@@ -2638,9 +3080,6 @@ function createParkedCar() {
     accent: 0xf4f0d8,
     scale: 0.95,
   });
-  const groundY = terrainHeight(PARKED_CAR_POSITION.x, PARKED_CAR_POSITION.z);
-  car.position.set(PARKED_CAR_POSITION.x, groundY + 0.05, PARKED_CAR_POSITION.z);
-  car.rotation.y = Math.PI - PARKED_CAR_YAW;
   car.traverse((node) => {
     if (node instanceof THREE.Mesh) {
       node.castShadow = true;
@@ -2648,7 +3087,29 @@ function createParkedCar() {
     }
   });
   parkedCarState.mesh = car;
+  applyParkedCarTransform();
   scene.add(car);
+}
+
+function syncParkedCarState(nextParkedCar) {
+  if (!nextParkedCar || typeof nextParkedCar !== "object") {
+    return;
+  }
+
+  parkedCarState.x = Number(nextParkedCar.x) || 0;
+  parkedCarState.z = Number(nextParkedCar.z) || 0;
+  parkedCarState.yaw = Number.isFinite(nextParkedCar.yaw) ? nextParkedCar.yaw : 0;
+  applyParkedCarTransform();
+}
+
+function applyParkedCarTransform() {
+  if (!parkedCarState.mesh) {
+    return;
+  }
+
+  const groundY = terrainHeight(parkedCarState.x, parkedCarState.z);
+  parkedCarState.mesh.position.set(parkedCarState.x, groundY + 0.05, parkedCarState.z);
+  parkedCarState.mesh.rotation.y = Math.PI - parkedCarState.yaw;
 }
 
 function createRailway() {
@@ -3073,6 +3534,29 @@ function createPersonalPlane(config) {
   cockpit.castShadow = true;
   airplane.add(cockpit);
 
+  for (const cockpitWindow of [
+    { x: 5.86, y: 3.18, z: -0.62, ry: -0.34, sx: 0.12, sy: 0.5, sz: 0.78 },
+    { x: 5.86, y: 3.18, z: 0.62, ry: 0.34, sx: 0.12, sy: 0.5, sz: 0.78 },
+    { x: 6.02, y: 3.12, z: -0.18, ry: -0.12, sx: 0.12, sy: 0.46, sz: 0.28 },
+    { x: 6.02, y: 3.12, z: 0.18, ry: 0.12, sx: 0.12, sy: 0.46, sz: 0.28 },
+  ]) {
+    const windowMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(cockpitWindow.sx, cockpitWindow.sy, cockpitWindow.sz),
+      new THREE.MeshStandardMaterial({
+        color: 0xb9def1,
+        emissive: 0x41657d,
+        emissiveIntensity: 0.24,
+        roughness: 0.1,
+        metalness: 0.36,
+        transparent: true,
+        opacity: 0.96,
+      }),
+    );
+    windowMesh.position.set(cockpitWindow.x, cockpitWindow.y, cockpitWindow.z);
+    windowMesh.rotation.y = cockpitWindow.ry;
+    airplane.add(windowMesh);
+  }
+
   for (const zOffset of [-3.6, 3.6]) {
     const engine = new THREE.Mesh(new THREE.CylinderGeometry(0.58, 0.68, 2.1, 12), detailMaterial);
     engine.rotation.z = Math.PI / 2;
@@ -3080,6 +3564,43 @@ function createPersonalPlane(config) {
     engine.castShadow = true;
     airplane.add(engine);
   }
+
+  const gearRoot = new THREE.Group();
+  for (const gear of [
+    { x: -1.6, y: 0.92, z: -1.95, front: false },
+    { x: -1.6, y: 0.92, z: 1.95, front: false },
+    { x: 5.4, y: 1.02, z: 0, front: true },
+  ]) {
+    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.12, gear.front ? 1.45 : 1.2, 0.12), detailMaterial);
+    strut.position.set(gear.x, gear.y, gear.z);
+    strut.castShadow = true;
+    gearRoot.add(strut);
+
+    const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.34, 0.22, 14), detailMaterial);
+    wheel.rotation.z = Math.PI / 2;
+    wheel.position.set(gear.x, gear.front ? 0.24 : 0.34, gear.z);
+    wheel.castShadow = true;
+    gearRoot.add(wheel);
+
+    if (gear.front) {
+      addAircraftHeadlight(
+        gearRoot,
+        {
+          position: { x: gear.x + 0.34, y: 0.82, z: gear.z },
+          target: { x: gear.x + 16, y: 0.3, z: gear.z },
+          radius: 0.16,
+          distance: 34,
+          lampOnIntensity: 1.8,
+          lightOnIntensity: 5.5,
+        },
+        { activeOnly: config.controlledLights === true },
+      );
+    }
+  }
+  airplane.add(gearRoot);
+  registerAircraftGear(airplane, gearRoot);
+
+  addAircraftBeacon(airplane, { x: -0.8, y: 0.62, z: 0 }, { activeOnly: config.controlledLights === true });
 
   return airplane;
 }
@@ -3193,6 +3714,29 @@ function createAirliner(config) {
   nose.castShadow = true;
   airplane.add(nose);
 
+  for (const cockpitWindow of [
+    { x: 11.12, y: 3.08, z: -0.78, ry: -0.38, sx: 0.12, sy: 0.58, sz: 0.9 },
+    { x: 11.12, y: 3.08, z: 0.78, ry: 0.38, sx: 0.12, sy: 0.58, sz: 0.9 },
+    { x: 10.18, y: 3.12, z: -0.28, ry: -0.16, sx: 0.12, sy: 0.4, sz: 0.34 },
+    { x: 10.18, y: 3.12, z: 0.28, ry: 0.16, sx: 0.12, sy: 0.4, sz: 0.34 },
+  ]) {
+    const windowMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(cockpitWindow.sx, cockpitWindow.sy, cockpitWindow.sz),
+      new THREE.MeshStandardMaterial({
+        color: 0xb4d5e7,
+        emissive: 0x3f6174,
+        emissiveIntensity: 0.22,
+        roughness: 0.12,
+        metalness: 0.38,
+        transparent: true,
+        opacity: 0.95,
+      }),
+    );
+    windowMesh.position.set(cockpitWindow.x, cockpitWindow.y, cockpitWindow.z);
+    windowMesh.rotation.y = cockpitWindow.ry;
+    airplane.add(windowMesh);
+  }
+
   const tailCone = new THREE.Mesh(new THREE.ConeGeometry(1.55, 4, 18), fuselageMaterial);
   tailCone.rotation.z = -Math.PI / 2;
   tailCone.position.set(-11.2, 2.5, 0);
@@ -3222,6 +3766,7 @@ function createAirliner(config) {
     airplane.add(engine);
   }
 
+  const gearRoot = new THREE.Group();
   for (const wheel of [
     { x: -4.5, y: 0.68, z: -1.6 },
     { x: -4.5, y: 0.68, z: 1.6 },
@@ -3229,14 +3774,38 @@ function createAirliner(config) {
   ]) {
     const strut = new THREE.Mesh(new THREE.BoxGeometry(0.14, 1.2, 0.14), darkMaterial);
     strut.position.set(wheel.x, 1.28, wheel.z);
-    airplane.add(strut);
+    gearRoot.add(strut);
 
     const tire = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.34, 0.22, 12), darkMaterial);
     tire.rotation.z = Math.PI / 2;
     tire.position.set(wheel.x, wheel.y, wheel.z);
     tire.castShadow = true;
-    airplane.add(tire);
+    gearRoot.add(tire);
+
+    if (wheel.z === 0) {
+      const lamp = new THREE.Mesh(
+        new THREE.SphereGeometry(0.18, 12, 10),
+        new THREE.MeshStandardMaterial({
+          color: 0xf5f1cb,
+          emissive: 0xffefb0,
+          emissiveIntensity: 1.9,
+          roughness: 0.22,
+          metalness: 0.08,
+        }),
+      );
+      lamp.position.set(wheel.x + 0.46, 1.0, wheel.z);
+      gearRoot.add(lamp);
+
+      const headlight = new THREE.SpotLight(0xfff4c8, 6, 42, Math.PI / 8, 0.5, 1.2);
+      headlight.position.set(wheel.x + 0.42, 1.02, wheel.z);
+      headlight.target.position.set(wheel.x + 18, 0.45, wheel.z);
+      headlight.castShadow = false;
+      gearRoot.add(headlight);
+      gearRoot.add(headlight.target);
+    }
   }
+  airplane.add(gearRoot);
+  registerAircraftGear(airplane, gearRoot);
 
   for (let i = -7; i <= 6; i += 1) {
     const windowMesh = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.18, 0.08), darkMaterial);
@@ -3247,6 +3816,8 @@ function createAirliner(config) {
     mirrored.position.z = 1.68;
     airplane.add(mirrored);
   }
+
+  addAircraftBeacon(airplane, { x: -1.2, y: 0.82, z: 0 });
 
   return airplane;
 }
@@ -3304,6 +3875,30 @@ function createConcorde(config) {
   cockpit.position.set(15.5, 2.86, 0);
   cockpit.rotation.z = THREE.MathUtils.degToRad(-8);
   airplane.add(cockpit);
+
+  for (const cockpitWindow of [
+    { x: 18.2, y: 2.58, z: -0.34, rz: THREE.MathUtils.degToRad(-18), sx: 0.12, sy: 0.28, sz: 0.34 },
+    { x: 18.2, y: 2.58, z: 0.34, rz: THREE.MathUtils.degToRad(-18), sx: 0.12, sy: 0.28, sz: 0.34 },
+    { x: 16.46, y: 2.94, z: -0.6, ry: -0.3, rz: THREE.MathUtils.degToRad(-10), sx: 0.12, sy: 0.28, sz: 0.64 },
+    { x: 16.46, y: 2.94, z: 0.6, ry: 0.3, rz: THREE.MathUtils.degToRad(-10), sx: 0.12, sy: 0.28, sz: 0.64 },
+  ]) {
+    const windowMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(cockpitWindow.sx, cockpitWindow.sy, cockpitWindow.sz),
+      new THREE.MeshStandardMaterial({
+        color: 0xb9d9eb,
+        emissive: 0x3b5d72,
+        emissiveIntensity: 0.24,
+        roughness: 0.1,
+        metalness: 0.36,
+        transparent: true,
+        opacity: 0.96,
+      }),
+    );
+    windowMesh.position.set(cockpitWindow.x, cockpitWindow.y, cockpitWindow.z);
+    windowMesh.rotation.y = cockpitWindow.ry ?? 0;
+    windowMesh.rotation.z = cockpitWindow.rz ?? 0;
+    airplane.add(windowMesh);
+  }
 
   const tailCone = new THREE.Mesh(new THREE.ConeGeometry(1.0, 6.4, 18), fuselageMaterial);
   tailCone.rotation.z = -Math.PI / 2;
@@ -3378,6 +3973,7 @@ function createConcorde(config) {
     airplane.add(intake);
   }
 
+  const gearRoot = new THREE.Group();
   for (const wheel of [
     { x: -4.8, y: 0.7, z: -1.2 },
     { x: -4.8, y: 0.7, z: 1.2 },
@@ -3389,8 +3985,32 @@ function createConcorde(config) {
     tire.rotation.z = Math.PI / 2;
     tire.position.set(wheel.x, wheel.y, wheel.z);
     tire.castShadow = true;
-    airplane.add(tire);
+    gearRoot.add(tire);
+
+    if (wheel.z === 0) {
+      const lamp = new THREE.Mesh(
+        new THREE.SphereGeometry(0.16, 12, 10),
+        new THREE.MeshStandardMaterial({
+          color: 0xf5f1cb,
+          emissive: 0xffefb0,
+          emissiveIntensity: 1.9,
+          roughness: 0.22,
+          metalness: 0.08,
+        }),
+      );
+      lamp.position.set(wheel.x + 0.58, 0.98, wheel.z);
+      gearRoot.add(lamp);
+
+      const headlight = new THREE.SpotLight(0xfff4c8, 6.2, 46, Math.PI / 8, 0.5, 1.2);
+      headlight.position.set(wheel.x + 0.5, 1.0, wheel.z);
+      headlight.target.position.set(wheel.x + 20, 0.42, wheel.z);
+      headlight.castShadow = false;
+      gearRoot.add(headlight);
+      gearRoot.add(headlight.target);
+    }
   }
+  airplane.add(gearRoot);
+  registerAircraftGear(airplane, gearRoot);
 
   for (let i = -10; i <= 8; i += 1) {
     const windowMesh = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.12, 0.06), darkMaterial);
@@ -3406,7 +4026,153 @@ function createConcorde(config) {
   stripe.position.set(1.2, 2.96, 0);
   airplane.add(stripe);
 
+  addAircraftBeacon(airplane, { x: -2.8, y: 0.84, z: 0 });
+
   return airplane;
+}
+
+function addAircraftBeacon(airplane, position, options = {}) {
+  const lens = new THREE.Mesh(
+    new THREE.SphereGeometry(0.14, 10, 10),
+    new THREE.MeshStandardMaterial({
+      color: 0xa11212,
+      emissive: 0xff2c2c,
+      emissiveIntensity: 0,
+      roughness: 0.24,
+      metalness: 0.08,
+      transparent: true,
+      opacity: 0.94,
+    }),
+  );
+  lens.position.set(position.x, position.y, position.z);
+  airplane.add(lens);
+
+  const beacon = new THREE.PointLight(0xff3b30, 0, 14, 2);
+  beacon.position.set(position.x, position.y + 0.04, position.z);
+  airplane.add(beacon);
+
+  const entry = {
+    type: "beacon",
+    lens,
+    beacon,
+    phase: Math.random() * Math.PI * 2,
+    enabled: options.activeOnly === true ? false : true,
+  };
+  registerAircraftLight(airplane, entry, options);
+  applyAircraftLightState(entry);
+}
+
+function updateAircraftBeacons(elapsedTime) {
+  const pulse = Math.max(0, Math.sin(elapsedTime * 7.5));
+  for (const entry of activeAircraftLights) {
+    if (entry.type !== "beacon") {
+      continue;
+    }
+    if (!entry.enabled) {
+      applyAircraftLightState(entry);
+      continue;
+    }
+    const intensity = Math.max(0, Math.sin((elapsedTime * 9.5) + entry.phase));
+    const blink = Math.max(pulse, intensity) ** 4;
+    if (entry.lens.material instanceof THREE.MeshStandardMaterial) {
+      entry.lens.material.emissiveIntensity = 0.25 + blink * 4.4;
+      entry.lens.material.opacity = 0.68 + blink * 0.26;
+    }
+    entry.beacon.intensity = blink * 3.8;
+  }
+}
+
+function addAircraftHeadlight(airplane, config, options = {}) {
+  const lamp = new THREE.Mesh(
+    new THREE.SphereGeometry(config.radius ?? 0.16, 12, 10),
+    new THREE.MeshStandardMaterial({
+      color: 0xf5f1cb,
+      emissive: 0xffefb0,
+      emissiveIntensity: 0,
+      roughness: 0.22,
+      metalness: 0.08,
+    }),
+  );
+  lamp.position.set(config.position.x, config.position.y, config.position.z);
+  airplane.add(lamp);
+
+  const headlight = new THREE.SpotLight(0xfff4c8, 0, config.distance, Math.PI / 8, 0.5, 1.2);
+  headlight.position.set(config.position.x - 0.04, config.position.y + 0.02, config.position.z);
+  headlight.target.position.set(config.target.x, config.target.y, config.target.z);
+  headlight.castShadow = false;
+  airplane.add(headlight);
+  airplane.add(headlight.target);
+
+  const entry = {
+    type: "headlight",
+    lamp,
+    headlight,
+    lampOnIntensity: config.lampOnIntensity ?? 1.8,
+    lampOffIntensity: 0,
+    lightOnIntensity: config.lightOnIntensity ?? 5.5,
+    enabled: options.activeOnly === true ? false : true,
+  };
+  registerAircraftLight(airplane, entry, options);
+  applyAircraftLightState(entry);
+}
+
+function registerAircraftLight(airplane, entry, options = {}) {
+  if (!Array.isArray(airplane.userData.controlledAircraftLights)) {
+    airplane.userData.controlledAircraftLights = [];
+  }
+  if (options.activeOnly === true) {
+    airplane.userData.controlledAircraftLights.push(entry);
+  }
+  activeAircraftLights.push(entry);
+}
+
+function setAircraftControlledLights(airplane, enabled) {
+  const controlledLights = airplane?.userData?.controlledAircraftLights;
+  if (!Array.isArray(controlledLights)) {
+    return;
+  }
+
+  for (const entry of controlledLights) {
+    if (entry.enabled === enabled) {
+      continue;
+    }
+    entry.enabled = enabled;
+    applyAircraftLightState(entry);
+  }
+}
+
+function applyAircraftLightState(entry) {
+  if (entry.type === "headlight") {
+    if (entry.lamp.material instanceof THREE.MeshStandardMaterial) {
+      entry.lamp.material.emissiveIntensity = entry.enabled ? entry.lampOnIntensity : entry.lampOffIntensity;
+    }
+    entry.headlight.intensity = entry.enabled ? entry.lightOnIntensity : 0;
+    return;
+  }
+
+  if (entry.lens.material instanceof THREE.MeshStandardMaterial) {
+    entry.lens.material.emissiveIntensity = entry.enabled ? 0.25 : 0;
+    entry.lens.material.opacity = entry.enabled ? 0.68 : 0.38;
+  }
+  entry.beacon.intensity = 0;
+}
+
+function registerAircraftGear(airplane, gearRoot) {
+  airplane.userData.gearRoot = gearRoot;
+  airplane.userData.gearDeployed = true;
+}
+
+function setAircraftGearDeployed(airplane, deployed) {
+  const gearRoot = airplane?.userData?.gearRoot;
+  if (!gearRoot) {
+    return;
+  }
+  if (airplane.userData.gearDeployed === deployed) {
+    return;
+  }
+
+  airplane.userData.gearDeployed = deployed;
+  gearRoot.visible = deployed;
 }
 
 function updateAirportTraffic(elapsedTime) {
@@ -3435,6 +4201,7 @@ function updateAirportTraffic(elapsedTime) {
     plane.mesh.rotation.set(0, yaw, 0, "YXZ");
     plane.mesh.rotateY(-Math.PI / 2);
     plane.mesh.rotateZ(-pitch * 0.35);
+    setAircraftGearDeployed(plane.mesh, sample.y - terrainHeight(sample.x, sample.z) <= 5.5);
 
     const onRunway = sample.y <= airportBaseTerrainHeight() + 1.62 && sample.z >= thresholdNorth && sample.z <= thresholdSouth;
     if (onRunway && !plane.wasOnRunway) {
@@ -3671,6 +4438,42 @@ function createTouchdownSmokeTexture() {
   gradient.addColorStop(1, "rgba(90,100,110,0)");
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.generateMipmaps = false;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  return texture;
+}
+
+function createPrecipitationTexture(type) {
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return null;
+  }
+
+  if (type === "rain") {
+    ctx.strokeStyle = "rgba(255,255,255,0.95)";
+    ctx.lineWidth = 4;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(size * 0.62, size * 0.08);
+    ctx.lineTo(size * 0.38, size * 0.92);
+    ctx.stroke();
+  } else {
+    const gradient = ctx.createRadialGradient(size / 2, size / 2, 4, size / 2, size / 2, size / 2);
+    gradient.addColorStop(0, "rgba(255,255,255,1)");
+    gradient.addColorStop(0.45, "rgba(248,252,255,0.95)");
+    gradient.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, size, size);
+  }
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;

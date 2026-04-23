@@ -13,8 +13,10 @@ export class PlayerState {
     pitch,
     inPlane,
     inCar,
+    vehicleMode,
     planeSpeed,
     carSpeed,
+    planeBraking,
     pendingPlaneCrash,
     avatar,
   }) {
@@ -31,8 +33,10 @@ export class PlayerState {
     this.pitch = pitch;
     this.inPlane = inPlane;
     this.inCar = inCar;
+    this.vehicleMode = vehicleMode ?? null;
     this.planeSpeed = planeSpeed;
     this.carSpeed = carSpeed;
+    this.planeBraking = !!planeBraking;
     this.pendingPlaneCrash = pendingPlaneCrash ?? null;
     this.avatar = {
       color: normalizeAvatarColor(avatar?.color),
@@ -55,8 +59,10 @@ export class PlayerState {
       pitch: 0,
       inPlane: false,
       inCar: false,
+      vehicleMode: null,
       planeSpeed: 0,
       carSpeed: 0,
+      planeBraking: false,
       pendingPlaneCrash: null,
       avatar: {
         color: "#3c74d4",
@@ -111,6 +117,7 @@ export class PlayerState {
     if (input.jumpRequested) {
       this.requestJump();
     }
+    this.planeBraking = input.planeBraking === true;
   }
 
   simulateTick(dtSeconds, config) {
@@ -119,7 +126,11 @@ export class PlayerState {
       return;
     }
     if (this.inCar) {
-      this.simulateCarTick(dtSeconds, config);
+      if (this.vehicleMode === "bus") {
+        this.simulateBusTick(dtSeconds, config);
+      } else {
+        this.simulateCarTick(dtSeconds, config);
+      }
       return;
     }
 
@@ -179,7 +190,10 @@ export class PlayerState {
 
     this.velocity.x = directionX * this.planeSpeed;
     this.velocity.z = directionZ * this.planeSpeed;
-    this.velocity.y = directionY * config.planeClimbRate;
+    const isFallingBrake = this.planeBraking && !this.onGround;
+    this.velocity.y = isFallingBrake
+      ? -Math.abs(config.planeBrakeFallRate)
+      : directionY * config.planeClimbRate;
 
     this.position.x += this.velocity.x * dtSeconds;
     this.position.y += this.velocity.y * dtSeconds;
@@ -226,6 +240,37 @@ export class PlayerState {
 
     this.enforceWorldBounds(config);
     this.enforceStaticObstacles(config);
+  }
+
+  simulateBusTick(_dtSeconds, config) {
+    const bus = config.bus;
+    if (!bus) {
+      this.inCar = false;
+      this.vehicleMode = null;
+      this.position.y = config.groundY;
+      this.velocity.x = 0;
+      this.velocity.y = 0;
+      this.velocity.z = 0;
+      this.carSpeed = 0;
+      this.planeSpeed = 0;
+      this.onGround = true;
+      return;
+    }
+
+    const busX = Number.isFinite(bus.x) ? bus.x : this.position.x;
+    const busZ = Number.isFinite(bus.z) ? bus.z : this.position.z;
+    const busYaw = Number.isFinite(bus.yaw) ? bus.yaw : this.yaw;
+    this.position.x = busX;
+    this.position.z = busZ;
+    this.position.y = config.groundY;
+    this.yaw = normalizeAngle(busYaw);
+    this.pitch = 0;
+    this.velocity.x = 0;
+    this.velocity.y = 0;
+    this.velocity.z = 0;
+    this.carSpeed = 0;
+    this.planeSpeed = 0;
+    this.onGround = true;
   }
 
   enforceWorldBounds(config) {
@@ -307,6 +352,7 @@ export class PlayerState {
   togglePlaneMode(config) {
     if (this.inPlane) {
       this.inPlane = false;
+      this.vehicleMode = null;
       this.planeSpeed = 0;
       this.position.y = Math.max(config.groundY, config.planeMinAltitude - 1.2);
       this.velocity.x = 0;
@@ -340,6 +386,7 @@ export class PlayerState {
       const exitSideX = Math.cos(exitYaw) * exitOffset;
       const exitSideZ = Math.sin(exitYaw) * exitOffset;
       this.inCar = false;
+      this.vehicleMode = null;
       this.carSpeed = 0;
       if (config.parkedCar) {
         config.parkedCar.x = this.position.x;
@@ -367,6 +414,7 @@ export class PlayerState {
 
     this.inPlane = false;
     this.inCar = true;
+    this.vehicleMode = "car";
     this.position.x = parkedCar.x;
     this.position.z = parkedCar.z;
     this.position.y = config.groundY;
@@ -386,6 +434,9 @@ export class PlayerState {
       return this.togglePlaneMode(config);
     }
     if (this.inCar) {
+      if (this.vehicleMode === "bus") {
+        return this.toggleBusMode(config);
+      }
       return this.toggleCarMode(config);
     }
 
@@ -397,7 +448,64 @@ export class PlayerState {
     if (nearestVehicle.type === "car") {
       return this.toggleCarMode(config);
     }
+    if (nearestVehicle.type === "bus") {
+      return this.toggleBusMode(config);
+    }
     return this.togglePlaneMode(config);
+  }
+
+  toggleBusMode(config) {
+    if (this.inCar && this.vehicleMode === "bus") {
+      const bus = config.bus;
+      const busYaw = Number.isFinite(bus?.yaw) ? bus.yaw : this.yaw;
+      const exitYaw = normalizeAngle(busYaw);
+      const exitOffset = 2.2;
+      const exitSideX = Math.cos(exitYaw) * exitOffset;
+      const exitSideZ = Math.sin(exitYaw) * exitOffset;
+
+      this.inCar = false;
+      this.vehicleMode = null;
+      this.carSpeed = 0;
+      this.position.x += exitSideX;
+      this.position.z += exitSideZ;
+      this.yaw = exitYaw;
+      this.pitch = 0;
+      this.position.y = config.groundY;
+      this.velocity.x = 0;
+      this.velocity.y = 0;
+      this.velocity.z = 0;
+      this.onGround = true;
+      this.enforceWorldBounds(config);
+      this.enforceStaticObstacles(config);
+      return true;
+    }
+
+    const bus = config.bus;
+    if (!bus || !bus.isStopped) {
+      return false;
+    }
+
+    const busRadius = Number.isFinite(bus.boardingRadius) ? bus.boardingRadius : 6.2;
+    const distance = Math.hypot(this.position.x - bus.x, this.position.z - bus.z);
+    if (distance > busRadius) {
+      return false;
+    }
+
+    this.inPlane = false;
+    this.inCar = true;
+    this.vehicleMode = "bus";
+    this.position.x = Number.isFinite(bus.x) ? bus.x : this.position.x;
+    this.position.z = Number.isFinite(bus.z) ? bus.z : this.position.z;
+    this.position.y = config.groundY;
+    this.yaw = normalizeAngle(Number.isFinite(bus.yaw) ? bus.yaw : 0);
+    this.pitch = 0;
+    this.velocity.x = 0;
+    this.velocity.y = 0;
+    this.velocity.z = 0;
+    this.planeSpeed = 0;
+    this.carSpeed = 0;
+    this.onGround = true;
+    return true;
   }
 
   checkPlaneCrash(config) {
@@ -460,6 +568,7 @@ export class PlayerState {
       pitch: this.pitch,
       inPlane: this.inPlane,
       inCar: this.inCar,
+      vehicleMode: this.vehicleMode,
       avatar: this.avatar,
     };
   }
@@ -552,6 +661,9 @@ function getNearestVehicle(position, config) {
   const candidates = [];
   if (config.parkedCar) {
     candidates.push({ type: "car", ...config.parkedCar });
+  }
+  if (config.bus && config.bus.isStopped === true) {
+    candidates.push({ type: "bus", ...config.bus });
   }
   if (config.parkedPlane) {
     candidates.push({ type: "plane", ...config.parkedPlane });

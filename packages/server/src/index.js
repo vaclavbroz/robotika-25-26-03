@@ -15,6 +15,15 @@ const INPUT_BUTTON_FORWARD = 1 << 1;
 const INPUT_BUTTON_BACKWARD = 1 << 2;
 const INPUT_BUTTON_LEFT = 1 << 3;
 const INPUT_BUTTON_RIGHT = 1 << 4;
+const INPUT_BUTTON_BRAKE = 1 << 5;
+const SIM_BUS_ROUTE = [
+  { x: 67, z: -76, stop: { duration: 2.6 } },
+  { x: -132, z: -88 },
+  { x: -132, z: -36 },
+  { x: -90, z: -36, stop: { duration: 2.4 } },
+  { x: -34, z: -36, stop: { duration: 3.0 } },
+  { x: -34, z: 146 },
+];
 const SIMULATION_CONFIG = {
   gravity: 24.0,
   jumpSpeed: 8.0,
@@ -51,6 +60,7 @@ const SIMULATION_CONFIG = {
   planeCruiseSpeed: 18,
   planeBoostSpeed: 18,
   planeBrakeSpeed: 10,
+  planeBrakeFallRate: 9,
   planeMinSpeed: 10,
   planeTurnSpeed: 1.7,
   planeClimbRate: 14,
@@ -91,6 +101,19 @@ const SIMULATION_CONFIG = {
       maxZ: 142,
     },
   ],
+  bus: {
+    route: SIM_BUS_ROUTE,
+    speed: 11,
+    segmentIndex: 0,
+    segmentProgress: 0,
+    stopHold: 0,
+    stopYaw: Math.PI,
+    isStopped: false,
+    x: SIM_BUS_ROUTE[0].x,
+    z: SIM_BUS_ROUTE[0].z,
+    yaw: Math.PI,
+    boardingRadius: 6.2,
+  },
 };
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PORT = Number(process.env.PORT || 9003);
@@ -150,6 +173,7 @@ server.listen(PORT, HOST, () => {
 });
 
 const simulationTimer = setInterval(() => {
+  updateBusMotion(SIM_DT_SECONDS);
   world.simulateTick(SIM_DT_SECONDS, SIMULATION_CONFIG);
   broadcastReplicationUpdate();
   broadcastCollisionEvents();
@@ -448,6 +472,77 @@ function onFrame(connection, opcode, payload) {
   }
 }
 
+function updateBusMotion(dtSeconds) {
+  const bus = SIMULATION_CONFIG.bus;
+  if (!bus || !Array.isArray(bus.route) || bus.route.length < 2 || !Number.isFinite(bus.speed)) {
+    return;
+  }
+
+  if (bus.stopHold > 0) {
+    bus.stopHold = Math.max(0, bus.stopHold - dtSeconds);
+    bus.isStopped = bus.stopHold > 0;
+    return;
+  }
+
+  const route = bus.route;
+  const segmentCount = route.length - 1;
+  let remaining = bus.speed * dtSeconds;
+  const maxIterations = route.length * 2;
+  let guard = 0;
+  while (remaining > 0 && guard < maxIterations) {
+    const start = route[bus.segmentIndex];
+    const nextSegmentIndex = bus.segmentIndex + 1;
+    const end = route[nextSegmentIndex] || route[0];
+    const segmentDx = end.x - start.x;
+    const segmentDz = end.z - start.z;
+    const segmentLength = Math.hypot(segmentDx, segmentDz);
+
+    if (segmentLength <= 0.001) {
+      bus.segmentIndex = (bus.segmentIndex + 1) % segmentCount;
+      bus.segmentProgress = 0;
+      guard += 1;
+      continue;
+    }
+
+    const remainingInSegment = segmentLength - bus.segmentProgress;
+    const arrivalIndex = nextSegmentIndex < route.length ? nextSegmentIndex : 0;
+    const arrivalStop = route[arrivalIndex] && route[arrivalIndex].stop;
+
+    if (remaining >= remainingInSegment) {
+      remaining -= remainingInSegment;
+      bus.segmentIndex = nextSegmentIndex < segmentCount ? nextSegmentIndex : 0;
+      bus.segmentProgress = 0;
+
+      if (arrivalStop && arrivalStop.duration > 0) {
+        const arrival = route[arrivalIndex];
+        bus.stopHold = arrivalStop.duration;
+        bus.stopYaw = Math.PI - Math.atan2(segmentDx, segmentDz);
+        bus.x = arrival.x;
+        bus.z = arrival.z;
+        bus.yaw = bus.stopYaw;
+        bus.isStopped = true;
+        return;
+      }
+
+      continue;
+    }
+
+    bus.segmentProgress += remaining;
+    break;
+  }
+
+  const activeStart = route[bus.segmentIndex];
+  const activeEnd = route[bus.segmentIndex + 1] || route[0];
+  const segmentDx = activeEnd.x - activeStart.x;
+  const segmentDz = activeEnd.z - activeStart.z;
+  const segmentLength = Math.hypot(segmentDx, segmentDz) || 1;
+  const t = bus.segmentProgress / segmentLength;
+  bus.x = activeStart.x + segmentDx * t;
+  bus.z = activeStart.z + segmentDz * t;
+  bus.yaw = Math.PI - Math.atan2(segmentDx, segmentDz);
+  bus.isStopped = false;
+}
+
 function parseInputMessage(message) {
   const buttonsBitmask =
     typeof message.buttonsBitmask === "number" && Number.isInteger(message.buttonsBitmask)
@@ -458,6 +553,7 @@ function parseInputMessage(message) {
   const backward = (buttonsBitmask & INPUT_BUTTON_BACKWARD) !== 0 ? 1 : 0;
   const left = (buttonsBitmask & INPUT_BUTTON_LEFT) !== 0 ? 1 : 0;
   const right = (buttonsBitmask & INPUT_BUTTON_RIGHT) !== 0 ? 1 : 0;
+  const brake = (buttonsBitmask & INPUT_BUTTON_BRAKE) !== 0;
 
   return {
     moveX: right - left,
@@ -465,6 +561,7 @@ function parseInputMessage(message) {
     yaw: typeof message.yaw === "number" ? message.yaw : 0,
     pitch: typeof message.pitch === "number" ? message.pitch : 0,
     jumpRequested: (buttonsBitmask & INPUT_BUTTON_JUMP) !== 0,
+    brake,
   };
 }
 

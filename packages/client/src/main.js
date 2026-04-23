@@ -26,6 +26,7 @@ const INPUT_BUTTON_FORWARD = 1 << 1;
 const INPUT_BUTTON_BACKWARD = 1 << 2;
 const INPUT_BUTTON_LEFT = 1 << 3;
 const INPUT_BUTTON_RIGHT = 1 << 4;
+const INPUT_BUTTON_BRAKE = 1 << 5;
 const DEBUG_NET = new URLSearchParams(window.location.search).get("debugNet") === "1";
 const WS_PORT = parsePort(import.meta.env.VITE_WS_PORT, 9003);
 const AIRPORT_CENTER = { x: 122, z: -88 };
@@ -42,6 +43,44 @@ const RAILWAY_Z = 156;
 const RAILWAY_Y = 8.2;
 const RAILWAY_STATION_X = -34;
 const CITY_CENTER = { x: -108, z: -42 };
+const BUS_ROUTE = [
+  {
+    x: AIRPORT_CENTER.x - 55,
+    z: AIRPORT_CENTER.z + 12,
+    stop: {
+      label: "Terminál",
+      duration: 2.6,
+      color: 0x2f79be,
+    },
+  },
+  { x: CITY_CENTER.x - 24, z: AIRPORT_CENTER.z + 4 },
+  { x: CITY_CENTER.x - 24, z: CITY_CENTER.z + 6 },
+  {
+    x: CITY_CENTER.x + 18,
+    z: CITY_CENTER.z + 6,
+    stop: {
+      label: "Město",
+      duration: 2.4,
+      color: 0x4f8e3f,
+    },
+  },
+  {
+    x: RAILWAY_STATION_X,
+    z: CITY_CENTER.z + 6,
+    stop: {
+      label: "Nádraží",
+      duration: 3.0,
+      color: 0x99622f,
+    },
+  },
+  { x: RAILWAY_STATION_X, z: RAILWAY_Z - 10 },
+];
+const BUS_SPEED = 11;
+const BUS_BOARDING_RADIUS = 7.0;
+const BUS_SCALE = 1.28;
+const BUS_BODY_COLOR = 0x205f9d;
+const BUS_ACCENT_COLOR = 0xffe58b;
+const BUS_WINDOW_COLOR = 0x8db4cc;
 const FOREST_CENTER = { x: 102, z: 118 };
 const PARKED_PLANE_POSITION = { x: 122, z: -88 };
 const PARKED_CAR_POSITION = { x: 8, z: 6 };
@@ -51,8 +90,8 @@ const NIGHT_DURATION_SECONDS = 3 * 60;
 const DAY_NIGHT_CYCLE_SECONDS = DAY_DURATION_SECONDS + NIGHT_DURATION_SECONDS;
 const RAIN_CYCLE_SECONDS = 10 * 60;
 const RAIN_DURATION_SECONDS = 2 * 60;
-const SNOW_CYCLE_SECONDS = 13 * 60;
-const SNOW_DURATION_SECONDS = 3 * 60;
+const SNOW_CYCLE_SECONDS = 5 * 60;
+const SNOW_DURATION_SECONDS = 2 * 60;
 const SNOW_COVER_HOLD_SECONDS = 5 * 60;
 const DAY_SKY_COLOR = new THREE.Color(0x87c9ff);
 const NIGHT_SKY_COLOR = new THREE.Color(0x07111d);
@@ -163,6 +202,7 @@ const keys = {
   backward: false,
   left: false,
   right: false,
+  brake: false,
 };
 
 const player = {
@@ -245,6 +285,15 @@ const rcPlaneState = {
   throttleDown: false,
   wasGrounded: false,
 };
+const busState = {
+  mesh: null,
+  segmentIndex: 0,
+  segmentProgress: 0,
+  speed: BUS_SPEED,
+  route: BUS_ROUTE,
+  stopHold: 0,
+  stopYaw: Math.PI,
+};
 const rcControllerState = {
   mesh: null,
 };
@@ -252,6 +301,7 @@ createAirport();
 createParkedCar();
 createRailway();
 createModelAirfield();
+createBus();
 createCity();
 createForest();
 let dragLookActive = false;
@@ -283,6 +333,9 @@ const onKey = (pressed) => (event) => {
       break;
     case "KeyD":
       keys.right = pressed;
+      break;
+    case "KeyB":
+      keys.brake = pressed;
       break;
     case "Space":
       if (pressed) net.jumpQueued = true;
@@ -405,6 +458,7 @@ window.addEventListener("blur", () => {
   keys.backward = false;
   keys.left = false;
   keys.right = false;
+  keys.brake = false;
   dragLookActive = false;
   net.jumpQueued = false;
   rcPlaneState.throttleUp = false;
@@ -431,6 +485,7 @@ function animate() {
   updateNetDebug();
   updateAirportTraffic(clock.elapsedTime);
   updateRailwayTraffic(clock.elapsedTime);
+  updateBusTraffic(dt);
   updateExplosions(dt);
   updateBurningWrecks(dt);
   updateTouchdownSmokes(dt);
@@ -760,6 +815,7 @@ function buildButtonsBitmask() {
   if (keys.backward) mask |= INPUT_BUTTON_BACKWARD;
   if (keys.left) mask |= INPUT_BUTTON_LEFT;
   if (keys.right) mask |= INPUT_BUTTON_RIGHT;
+  if (keys.brake) mask |= INPUT_BUTTON_BRAKE;
   return mask;
 }
 
@@ -978,7 +1034,13 @@ function updateParkedPlaneAvailability(authoritative, x, z) {
   if (!localInPlane && !localInCar) {
     const planeDistance = Math.hypot(x - PARKED_PLANE_POSITION.x, z - PARKED_PLANE_POSITION.z);
     const carDistance = Math.hypot(x - parkedCarState.x, z - parkedCarState.z);
-    if (carDistance <= 12 && carDistance < planeDistance) {
+    const busDistance = busState.mesh
+      ? Math.hypot(x - busState.mesh.position.x, z - busState.mesh.position.z)
+      : Number.POSITIVE_INFINITY;
+    const busCanBoard = busDistance <= BUS_BOARDING_RADIUS && busState.stopHold > 0;
+    if (busCanBoard) {
+      setHelpStatus("Press F to board the bus at the stop.", "Bus Ready");
+    } else if (carDistance <= 12 && carDistance < planeDistance) {
       setHelpStatus("Press F to board the car and drive.", "Car Ready");
     } else if (planeDistance <= 18) {
       setHelpStatus("Press F to board the plane on the airport and fly.", "Aircraft Ready");
@@ -2863,17 +2925,21 @@ function createWeatherState() {
       driftAmount: 1.8,
     }),
     snow: createPrecipitationSystem({
-      count: 240,
+      type: "snow",
+      count: 560,
       texture: createPrecipitationTexture("snow"),
       color: 0xf5fbff,
-      size: 0.42,
-      opacity: 0.92,
-      radius: 34,
-      height: 28,
-      minGroundOffset: 1.2,
-      speedMin: 3.4,
-      speedMax: 6.2,
-      driftAmount: 0.75,
+      size: 0.5,
+      opacity: 0.96,
+      radius: 40,
+      height: 32,
+      minGroundOffset: 1.0,
+      speedMin: 1.8,
+      speedMax: 3.8,
+      driftAmount: 0.2,
+      swayAmount: 1.25,
+      swaySpeedMin: 0.8,
+      swaySpeedMax: 1.9,
     }),
   };
 }
@@ -2961,6 +3027,11 @@ function createPrecipitationSystem(config) {
   const positions = new Float32Array(config.count * 3);
   const speeds = new Float32Array(config.count);
   const drift = new Float32Array(config.count * 2);
+  const swayPhase = new Float32Array(config.count);
+  const swaySpeed = new Float32Array(config.count);
+  const swaySpeedMin = config.swaySpeedMin || 0;
+  const swaySpeedMax = config.swaySpeedMax || 0;
+  const swaySpeedRange = Math.max(0, swaySpeedMax - swaySpeedMin);
   const material = new THREE.PointsMaterial({
     map: config.texture,
     color: config.color,
@@ -2981,6 +3052,8 @@ function createPrecipitationSystem(config) {
     speeds[i] = THREE.MathUtils.lerp(config.speedMin, config.speedMax, Math.random());
     drift[(i * 2) + 0] = (Math.random() - 0.5) * config.driftAmount;
     drift[(i * 2) + 1] = (Math.random() - 0.5) * config.driftAmount;
+    swayPhase[i] = Math.random() * Math.PI * 2;
+    swaySpeed[i] = Math.random() * swaySpeedRange + swaySpeedMin;
   }
 
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -2991,9 +3064,13 @@ function createPrecipitationSystem(config) {
     speeds,
     drift,
     count: config.count,
+    type: config.type || null,
     radius: config.radius,
     height: config.height,
     minGroundOffset: config.minGroundOffset,
+    swayAmount: config.swayAmount || 0,
+    swayPhase,
+    swaySpeed,
   };
 }
 
@@ -3010,15 +3087,25 @@ function updatePrecipitationSystem(system, dt, anchor, active) {
     let y = positions[index + 1];
     let z = positions[index + 2];
     const groundY = terrainHeight(x, z);
+    const driftX = system.drift[(i * 2) + 0];
+    const driftZ = system.drift[(i * 2) + 1];
 
     if (y < groundY + system.minGroundOffset || y > anchor.y + system.height + 2 || Number.isNaN(y)) {
       respawnPrecipitationParticle(system, i, anchor);
       continue;
     }
 
-    x += system.drift[(i * 2) + 0] * dt;
-    y -= system.speeds[i] * dt;
-    z += system.drift[(i * 2) + 1] * dt;
+    if (system.type === "snow" && system.swayAmount > 0) {
+      const phase = system.swayPhase[i] + (system.swaySpeed[i] * dt);
+      system.swayPhase[i] = phase;
+      x += (driftX + Math.sin(phase) * system.swayAmount) * dt;
+      y -= system.speeds[i] * dt;
+      z += (driftZ + Math.cos(phase) * (system.swayAmount * 0.6)) * dt;
+    } else {
+      x += driftX * dt;
+      y -= system.speeds[i] * dt;
+      z += driftZ * dt;
+    }
 
     if (Math.abs(x - anchor.x) > system.radius || Math.abs(z - anchor.z) > system.radius) {
       respawnPrecipitationParticle(system, i, anchor);
@@ -3035,9 +3122,10 @@ function updatePrecipitationSystem(system, dt, anchor, active) {
 
 function respawnPrecipitationParticle(system, particleIndex, anchor) {
   const index = particleIndex * 3;
-  const x = anchor.x + (Math.random() - 0.5) * system.radius * 2;
-  const z = anchor.z + (Math.random() - 0.5) * system.radius * 2;
-  const top = anchor.y + Math.random() * system.height + 6;
+  const radiusScale = system.type === "snow" ? 1.2 : 1;
+  const x = anchor.x + (Math.random() - 0.5) * system.radius * 2 * radiusScale;
+  const z = anchor.z + (Math.random() - 0.5) * system.radius * 2 * radiusScale;
+  const top = anchor.y + (system.type === "snow" ? 10 : 6) + Math.random() * (system.height + (system.type === "snow" ? 10 : 0));
   system.positions[index + 0] = x;
   system.positions[index + 1] = top;
   system.positions[index + 2] = z;
@@ -3089,6 +3177,249 @@ function createParkedCar() {
   parkedCarState.mesh = car;
   applyParkedCarTransform();
   scene.add(car);
+}
+
+function createBusVehicle(config) {
+  const bodyColor = config?.bodyColor ?? BUS_BODY_COLOR;
+  const accentColor = config?.accentColor ?? BUS_ACCENT_COLOR;
+  const windowColor = config?.windowColor ?? BUS_WINDOW_COLOR;
+  const scale = config?.scale ?? BUS_SCALE;
+  const bus = new THREE.Group();
+
+  const busMaterial = new THREE.MeshStandardMaterial({
+    color: bodyColor,
+    roughness: 0.47,
+    metalness: 0.15,
+  });
+  const accentMaterial = new THREE.MeshStandardMaterial({
+    color: accentColor,
+    emissive: 0x4f4a2c,
+    emissiveIntensity: 0.08,
+    roughness: 0.26,
+    metalness: 0.28,
+  });
+  const windowMaterial = new THREE.MeshStandardMaterial({
+    color: windowColor,
+    emissive: 0x2f5265,
+    emissiveIntensity: 0.26,
+    roughness: 0.12,
+    metalness: 0.62,
+    transparent: true,
+    opacity: 0.9,
+  });
+
+  const body = new THREE.Mesh(new THREE.BoxGeometry(3.25, 2.1, 8.2), busMaterial);
+  body.position.set(0, 1.55, 0.1);
+  bus.add(body);
+
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(2.95, 0.85, 6.4), busMaterial);
+  roof.position.set(0, 2.9, 0);
+  bus.add(roof);
+
+  const stripe = new THREE.Mesh(new THREE.BoxGeometry(3.04, 0.22, 8.1), accentMaterial);
+  stripe.position.set(0, 2.08, 0.08);
+  bus.add(stripe);
+
+  const front = new THREE.Mesh(new THREE.BoxGeometry(3.3, 0.6, 0.34), accentMaterial);
+  front.position.set(0, 1.4, 4.0);
+  bus.add(front);
+  const rear = new THREE.Mesh(new THREE.BoxGeometry(3.1, 0.62, 0.34), accentMaterial);
+  rear.position.set(0, 1.4, -4.15);
+  bus.add(rear);
+
+  for (const i of [-1, 1]) {
+    const panel = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22, 2.05, 4.8),
+      new THREE.MeshStandardMaterial({
+        color: 0x1e1e20,
+        roughness: 0.32,
+        metalness: 0.2,
+      }),
+    );
+    panel.position.set(i * 1.61, 1.4, -0.3);
+    bus.add(panel);
+  }
+
+  for (const zOffset of [-0.3, 1.05, 2.4]) {
+    const seatWindow = new THREE.Mesh(new THREE.BoxGeometry(2.85, 1.18, 0.1), windowMaterial);
+    seatWindow.position.set(0, 1.98, zOffset);
+    bus.add(seatWindow);
+  }
+
+  const bumper = new THREE.Mesh(
+    new THREE.BoxGeometry(3.18, 0.32, 0.52),
+    new THREE.MeshStandardMaterial({ color: 0x0d0f11, roughness: 0.42 }),
+  );
+  bumper.position.set(0, 0.72, 4.1);
+  bus.add(bumper);
+
+  const headlights = [
+    { x: -0.9, z: 4.36 },
+    { x: 0.9, z: 4.36 },
+  ];
+  for (const light of headlights) {
+    const headlamp = new THREE.Mesh(
+      new THREE.BoxGeometry(0.6, 0.28, 0.16),
+      new THREE.MeshStandardMaterial({
+        color: 0xfff5d7,
+        emissive: 0xfff5d7,
+        emissiveIntensity: 0.34,
+        roughness: 0.22,
+      }),
+    );
+    headlamp.position.set(light.x, 1.2, light.z);
+    bus.add(headlamp);
+  }
+
+  for (const side of [-1, 1]) {
+    for (const axleZ of [-3.0, -1.15, 0.95, 2.95]) {
+      const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.54, 0.54, 0.52, 22), new THREE.MeshStandardMaterial({
+        color: 0x16181b,
+        roughness: 0.95,
+        metalness: 0.12,
+      }));
+      wheel.rotation.z = Math.PI * 0.5;
+      wheel.position.set(side * 1.72, 0.42, axleZ);
+      bus.add(wheel);
+
+      const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.56, 16), new THREE.MeshStandardMaterial({
+        color: 0xd9dee4,
+        roughness: 0.3,
+        metalness: 0.6,
+      }));
+      rim.rotation.z = Math.PI * 0.5;
+      rim.position.set(side * 1.72, 0.42, axleZ);
+      bus.add(rim);
+    }
+  }
+
+  bus.scale.setScalar(scale);
+  return bus;
+}
+
+function createBusStops() {
+  if (!busState.route || busState.route.length < 2) {
+    return;
+  }
+
+  const stopParent = new THREE.Group();
+  stopParent.name = "bus-stops";
+  busState.stops = [];
+
+  for (let i = 0; i < busState.route.length; i += 1) {
+    const point = busState.route[i];
+    const stop = point.stop;
+    if (!stop) {
+      continue;
+    }
+
+    const routeEndIndex = i < busState.route.length - 1 ? i + 1 : i - 1;
+    const routeEnd = busState.route[routeEndIndex];
+    const dirX = routeEnd.x - point.x;
+    const dirZ = routeEnd.z - point.z;
+    const dirYaw = Math.atan2(dirX, dirZ);
+    const sideX = Math.cos(dirYaw + Math.PI / 2);
+    const sideZ = Math.sin(dirYaw + Math.PI / 2);
+    const stopY = terrainHeight(point.x, point.z);
+
+    const node = new THREE.Group();
+    node.position.set(
+      point.x + sideX * 1.35,
+      stopY + 0.02,
+      point.z + sideZ * 1.35,
+    );
+    node.rotation.y = Math.PI - dirYaw;
+
+    const platform = new THREE.Mesh(
+      new THREE.BoxGeometry(1.8, 0.16, 1.2),
+      new THREE.MeshStandardMaterial({
+        color: 0x2f3337,
+        roughness: 0.8,
+      }),
+    );
+    platform.position.set(0, 0.08, 0);
+    platform.receiveShadow = true;
+    node.add(platform);
+
+    const pole = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.07, 0.07, 1.45, 14),
+      new THREE.MeshStandardMaterial({
+        color: stop.color,
+        roughness: 0.3,
+        metalness: 0.25,
+      }),
+    );
+    pole.position.set(-0.52, 0.84, 0.24);
+    pole.castShadow = true;
+    node.add(pole);
+
+    const cap = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.1, 0.1, 0.2, 12),
+      new THREE.MeshStandardMaterial({
+        color: stop.color,
+        roughness: 0.2,
+        metalness: 0.45,
+      }),
+    );
+    cap.position.set(-0.52, 1.53, 0.24);
+    node.add(cap);
+
+    const sign = new THREE.Mesh(
+      new THREE.BoxGeometry(0.1, 0.72, 0.56),
+      new THREE.MeshStandardMaterial({
+        color: stop.color,
+        roughness: 0.2,
+        metalness: 0.35,
+      }),
+    );
+    sign.position.set(-0.16, 1.15, 0.2);
+    node.add(sign);
+
+    const marker = new THREE.Mesh(
+      new THREE.BoxGeometry(0.14, 0.14, 0.14),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.15,
+      }),
+    );
+    marker.position.set(-0.16, 1.45, 0.2);
+    node.add(marker);
+
+    stopParent.add(node);
+    busState.stops.push(node);
+  }
+
+  scene.add(stopParent);
+}
+
+function createBus() {
+  if (!busState.route || busState.route.length < 2) {
+    return;
+  }
+
+  const bus = createBusVehicle({
+    bodyColor: BUS_BODY_COLOR,
+    accentColor: BUS_ACCENT_COLOR,
+    windowColor: BUS_WINDOW_COLOR,
+    scale: BUS_SCALE,
+  });
+  bus.traverse((node) => {
+    if (node instanceof THREE.Mesh) {
+      node.castShadow = true;
+      node.receiveShadow = true;
+    }
+  });
+
+  busState.mesh = bus;
+  busState.segmentIndex = 0;
+  busState.segmentProgress = 0;
+  busState.stopHold = 0;
+  busState.stopYaw = Math.PI;
+  const start = busState.route[0];
+  const startY = terrainHeight(start.x, start.z);
+  bus.position.set(start.x, startY + 0.05, start.z);
+  bus.rotation.set(0, Math.PI, 0, "YXZ");
+  scene.add(bus);
 }
 
 function syncParkedCarState(nextParkedCar) {
@@ -3357,30 +3688,79 @@ function createForest() {
     new THREE.MeshStandardMaterial({ color: 0x2f5d31, roughness: 0.95, metalness: 0.01 }),
   ];
 
-  for (let row = -3; row <= 3; row += 1) {
-    for (let col = -3; col <= 3; col += 1) {
-      const x = FOREST_CENTER.x + col * 11 + (row % 2) * 3;
-      const z = FOREST_CENTER.z + row * 13 + (col % 2) * 2;
-      const groundY = terrainHeight(x, z);
-      const treeHeight = 5.5 + ((row + col + 12) % 4) * 1.4;
-      const trunk = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.6, 0.8, treeHeight, 8),
-        trunkMaterial,
-      );
-      trunk.position.set(x, groundY + treeHeight * 0.5, z);
-      trunk.castShadow = true;
-      forest.add(trunk);
+  const blockedTreeZones = [
+    { minX: AIRPORT_CENTER.x - 95, maxX: AIRPORT_CENTER.x + 80, minZ: AIRPORT_CENTER.z - 155, maxZ: AIRPORT_CENTER.z + 80 },
+    { minX: MODEL_AIRFIELD_CENTER.x - 55, maxX: MODEL_AIRFIELD_CENTER.x + 55, minZ: MODEL_AIRFIELD_CENTER.z - 78, maxZ: MODEL_AIRFIELD_CENTER.z + 72 },
+    { minX: CITY_CENTER.x - 44, maxX: CITY_CENTER.x + 44, minZ: CITY_CENTER.z - 52, maxZ: CITY_CENTER.z + 72 },
+    { minX: -WORLD_SIZE * 0.5 - 20, maxX: WORLD_SIZE * 0.5 + 20, minZ: RAILWAY_Z - 8, maxZ: RAILWAY_Z + 16 },
+    { minX: RAILWAY_STATION_X - 16, maxX: RAILWAY_STATION_X + 16, minZ: RAILWAY_Z - 36, maxZ: RAILWAY_Z - 2 },
+    { minX: -8, maxX: 8, minZ: -3, maxZ: 10 },
+    { minX: PARKED_PLANE_POSITION.x - 16, maxX: PARKED_PLANE_POSITION.x + 16, minZ: PARKED_PLANE_POSITION.z - 16, maxZ: PARKED_PLANE_POSITION.z + 16 },
+    { minX: PARKED_CAR_POSITION.x - 10, maxX: PARKED_CAR_POSITION.x + 10, minZ: PARKED_CAR_POSITION.z - 10, maxZ: PARKED_CAR_POSITION.z + 10 },
+  ];
 
-      const foliage = new THREE.Mesh(
-        new THREE.ConeGeometry(3.8 + ((row + col + 10) % 3) * 0.7, 7 + (row % 3) * 1.1, 10),
-        foliageMaterials[Math.abs(row + col) % foliageMaterials.length],
-      );
-      foliage.position.set(x, groundY + treeHeight + 3.6, z);
-      foliage.castShadow = true;
-      foliage.receiveShadow = true;
-      forest.add(foliage);
+  const isPointBlocked = (x, z) => {
+    const safeRadius = 3.8;
+    for (const zone of blockedTreeZones) {
+      const minX = zone.minX - safeRadius;
+      const maxX = zone.maxX + safeRadius;
+      const minZ = zone.minZ - safeRadius;
+      const maxZ = zone.maxZ + safeRadius;
+      if (x >= minX && x <= maxX && z >= minZ && z <= maxZ) {
+        return true;
+      }
     }
-  }
+    return false;
+  };
+
+  const addTree = (x, z, row, col) => {
+    const groundY = terrainHeight(x, z);
+    const variance = Math.abs(Math.sin((row + 17.1) * 0.72 + (col - 13.3) * 0.48));
+    const treeHeight = 4.8 + (variance * 2.4);
+    const foliageHeight = 6.2 + (variance * 2.3);
+    const foliageRadius = 3.2 + (row % 4) * 0.46;
+    const trunk = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.42 + (col % 2) * 0.07, 0.63 + (row % 3) * 0.06, treeHeight, 8),
+      trunkMaterial,
+    );
+    trunk.position.set(x, groundY + treeHeight * 0.5, z);
+    trunk.castShadow = true;
+    forest.add(trunk);
+
+    const foliage = new THREE.Mesh(
+      new THREE.ConeGeometry(foliageRadius, foliageHeight, 10),
+      foliageMaterials[Math.abs(row + col) % foliageMaterials.length],
+    );
+    foliage.position.set(x, groundY + treeHeight + foliageHeight * 0.46, z);
+    foliage.castShadow = true;
+    foliage.receiveShadow = true;
+    forest.add(foliage);
+  };
+
+  const addCluster = (centerX, centerZ, rows, cols, baseSpacingX, baseSpacingZ, jitterSeed = 1) => {
+    for (let row = 0; row < rows; row += 1) {
+      for (let col = 0; col < cols; col += 1) {
+        const spacingX = baseSpacingX + ((row + col + jitterSeed) % 4) * 0.7;
+        const spacingZ = baseSpacingZ + ((row * 1.8 + col + jitterSeed) % 3) * 0.55;
+        const jitterX = ((Math.sin((row * 7.7 + col * 3.4 + jitterSeed) * 0.67) * 1.4) + ((col % 2) * 0.7 - 0.35));
+        const jitterZ = ((Math.cos((row * 4.9 + col * 5.2 + jitterSeed) * 0.73) * 1.2) + ((row % 2) * 0.6 - 0.3));
+        const x = centerX + (col - (cols * 0.5)) * spacingX + jitterX;
+        const z = centerZ + (row - (rows * 0.5)) * spacingZ + jitterZ;
+        if (isPointBlocked(x, z)) {
+          continue;
+        }
+
+        addTree(x, z, row + jitterSeed, col + jitterSeed);
+      }
+    }
+  };
+
+  addCluster(FOREST_CENTER.x, FOREST_CENTER.z, 14, 14, 6.8, 7.6, 1);
+  addCluster(CITY_CENTER.x - 34, CITY_CENTER.z + 72, 11, 9, 6.4, 7.1, 5);
+  addCluster(RAILWAY_STATION_X + 36, RAILWAY_Z + 10, 9, 10, 5.8, 6.3, 8);
+  addCluster(-30, 148, 8, 10, 6.1, 6.9, 12);
+  addCluster(AIRPORT_CENTER.x - 52, AIRPORT_CENTER.z + 66, 10, 10, 6.5, 6.8, 17);
+  addCluster(150, 60, 8, 7, 7.1, 7.4, 21);
 
   scene.add(forest);
 }
@@ -4256,6 +4636,75 @@ function updateRailwayTraffic(elapsedTime) {
     const offset = ((elapsedTime * train.speed) + distance * train.phase) % distance;
     train.mesh.position.x = train.startX + offset;
   }
+}
+
+function updateBusTraffic(dt) {
+  if (!busState.mesh || busState.route.length < 2) {
+    return;
+  }
+
+  if (busState.stopHold > 0) {
+    busState.stopHold = Math.max(0, busState.stopHold - dt);
+    busState.mesh.rotation.set(0, busState.stopYaw, 0, "YXZ");
+    return;
+  }
+
+  const route = busState.route;
+  const segmentCount = route.length - 1;
+  let remaining = busState.speed * dt;
+  const maxIterations = route.length * 2;
+  let guard = 0;
+
+  while (remaining > 0 && guard < maxIterations) {
+    const start = route[busState.segmentIndex];
+    const nextSegmentIndex = busState.segmentIndex + 1;
+    const end = route[nextSegmentIndex] || route[0];
+    const segmentDx = end.x - start.x;
+    const segmentDz = end.z - start.z;
+    const segmentLength = Math.hypot(segmentDx, segmentDz);
+    const arrivalIndex = nextSegmentIndex < route.length ? nextSegmentIndex : 0;
+    const arrivalStop = route[arrivalIndex] && route[arrivalIndex].stop;
+
+    if (segmentLength <= 0.001) {
+      busState.segmentIndex = (busState.segmentIndex + 1) % segmentCount;
+      busState.segmentProgress = 0;
+      guard += 1;
+      continue;
+    }
+
+    const remainingInSegment = segmentLength - busState.segmentProgress;
+    if (remaining >= remainingInSegment) {
+      remaining -= remainingInSegment;
+      busState.segmentIndex = nextSegmentIndex < segmentCount ? nextSegmentIndex : 0;
+      busState.segmentProgress = 0;
+      if (arrivalStop && arrivalStop.duration > 0) {
+        const arrival = route[arrivalIndex];
+        busState.stopHold = arrivalStop.duration;
+        busState.stopYaw = Math.PI - Math.atan2(segmentDx, segmentDz);
+        busState.mesh.position.set(arrival.x, terrainHeight(arrival.x, arrival.z) + 0.05, arrival.z);
+        busState.mesh.rotation.set(0, busState.stopYaw, 0, "YXZ");
+        return;
+      }
+      continue;
+    }
+
+    busState.segmentProgress += remaining;
+    break;
+  }
+
+  const activeStart = route[busState.segmentIndex];
+  const activeEnd = route[busState.segmentIndex + 1] || route[0];
+  const segmentDx = activeEnd.x - activeStart.x;
+  const segmentDz = activeEnd.z - activeStart.z;
+  const segmentLength = Math.hypot(segmentDx, segmentDz) || 1;
+  const t = busState.segmentProgress / segmentLength;
+  const worldX = activeStart.x + segmentDx * t;
+  const worldZ = activeStart.z + segmentDz * t;
+  const worldY = terrainHeight(worldX, worldZ) + 0.05;
+
+  busState.mesh.position.set(worldX, worldY, worldZ);
+  const directionYaw = Math.atan2(segmentDx, segmentDz);
+  busState.mesh.rotation.set(0, Math.PI - directionYaw, 0, "YXZ");
 }
 
 function terrainBaseForSphereAt(x, z, radius) {

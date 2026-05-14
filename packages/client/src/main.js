@@ -5,10 +5,6 @@ const TERRAIN_SEGMENTS = 220;
 const TERRAIN_HALF_SIZE = WORLD_SIZE * 0.5;
 const TERRAIN_GRID_STEP = WORLD_SIZE / TERRAIN_SEGMENTS;
 const PLAYER_HEIGHT = 1.55;
-const RC_PLANE_MIN_ALTITUDE = 1.2;
-const RC_PLANE_MAX_ALTITUDE = 28;
-const RC_PLANE_MIN_SPEED = 8;
-const RC_PLANE_MAX_SPEED = 26;
 const AVATAR_BALL_RADIUS = 0.75;
 const AVATAR_LABEL_Y = 1.15;
 const GROUND_CONTACT_VISUAL_BIAS = 0.03;
@@ -41,11 +37,6 @@ const AIRPORT_RUNWAY_LENGTH = 118;
 const AIRPORT_RUNWAY_WIDTH = 24;
 const AIRPORT_FLATTEN_RADIUS_X = 76;
 const AIRPORT_FLATTEN_RADIUS_Z = 48;
-const MODEL_AIRFIELD_CENTER = { x: -176, z: 92 };
-const MODEL_AIRFIELD_RUNWAY_LENGTH = 54;
-const MODEL_AIRFIELD_RUNWAY_WIDTH = 10;
-const MODEL_AIRFIELD_FLATTEN_RADIUS_X = 40;
-const MODEL_AIRFIELD_FLATTEN_RADIUS_Z = 28;
 const RAILWAY_Z = 156;
 const RAILWAY_Y = 8.2;
 const RAILWAY_STATION_X = -34;
@@ -373,19 +364,6 @@ const parkedCarState = {
   z: PARKED_CAR_POSITION.z,
   yaw: PARKED_CAR_YAW,
 };
-const rcPlaneState = {
-  active: false,
-  mesh: null,
-  selectedType: "propeller",
-  position: new THREE.Vector3(),
-  velocity: new THREE.Vector3(),
-  yaw: 0,
-  pitch: 0,
-  speed: 0,
-  throttleUp: false,
-  throttleDown: false,
-  wasGrounded: false,
-};
 const busState = {
   mesh: null,
   segmentIndex: 0,
@@ -395,13 +373,9 @@ const busState = {
   stopHold: 0,
   stopYaw: Math.PI,
 };
-const rcControllerState = {
-  mesh: null,
-};
 createAirport();
 createParkedCar();
 createRailway();
-createModelAirfield();
 createBus();
 createCity();
 createForest();
@@ -447,9 +421,6 @@ const onKey = (pressed) => (event) => {
       break;
     case "KeyF":
       if (pressed) togglePlaneBoarding();
-      break;
-    case "KeyV":
-      if (pressed) toggleRcPlane();
       break;
     default:
       break;
@@ -522,36 +493,18 @@ document.addEventListener("mousemove", (event) => {
   if (!pointerLocked && !dragLookActive) return;
 
   const sensitivity = 0.0022;
-  if (rcPlaneState.active) {
-    rcPlaneState.yaw += event.movementX * sensitivity;
-    rcPlaneState.pitch = Math.max(-MAX_PITCH * 0.85, Math.min(MAX_PITCH * 0.85, rcPlaneState.pitch - event.movementY * sensitivity));
-  } else {
-    player.courseYaw += event.movementX * sensitivity;
-    player.pitch -= event.movementY * sensitivity;
-    player.pitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, player.pitch));
-  }
+  player.courseYaw += event.movementX * sensitivity;
+  player.pitch -= event.movementY * sensitivity;
+  player.pitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, player.pitch));
 });
 
 renderer.domElement.addEventListener("mousedown", (event) => {
-  if (rcPlaneState.active) {
-    if (event.button === 0) {
-      rcPlaneState.throttleUp = true;
-    } else if (event.button === 2) {
-      rcPlaneState.throttleDown = true;
-    }
-    return;
-  }
   if (event.button === 0 && document.pointerLockElement !== renderer.domElement) {
     dragLookActive = true;
   }
 });
 
 window.addEventListener("mouseup", (event) => {
-  if (event.button === 0) {
-    rcPlaneState.throttleUp = false;
-  } else if (event.button === 2) {
-    rcPlaneState.throttleDown = false;
-  }
   dragLookActive = false;
 });
 
@@ -563,14 +516,6 @@ window.addEventListener("blur", () => {
   keys.brake = false;
   dragLookActive = false;
   net.jumpQueued = false;
-  rcPlaneState.throttleUp = false;
-  rcPlaneState.throttleDown = false;
-});
-
-window.addEventListener("contextmenu", (event) => {
-  if (rcPlaneState.active) {
-    event.preventDefault();
-  }
 });
 
 const clock = new THREE.Clock();
@@ -606,24 +551,15 @@ function animate() {
   const localState = net.playerId ? net.playersById.get(net.playerId) : null;
   const localPlane = net.playerId ? net.playerPlanesById.get(net.playerId) : null;
   const localCar = net.playerId ? net.playerCarsById.get(net.playerId) : null;
-  updateRcPlane(dt);
   if (parkedPlaneState.mesh) {
     setAircraftControlledLights(parkedPlaneState.mesh, false);
   }
   if (localPlane) {
     setAircraftControlledLights(localPlane, localState?.inPlane === true);
   }
-  if (rcPlaneState.mesh) {
-    setAircraftControlledLights(rcPlaneState.mesh, rcPlaneState.active === true);
-  }
   detectLocalPlaneTrafficCollision(localState, localPlane, clock.elapsedTime);
   updatePlaneWarning(localState);
-  if (rcPlaneState.active && rcPlaneState.mesh) {
-    camera.position.copy(player.position);
-    cameraTarget.copy(rcPlaneState.mesh.position);
-    cameraTarget.y += 0.6;
-    camera.lookAt(cameraTarget);
-  } else if (localState?.inPlane && localPlane) {
+  if (localState?.inPlane && localPlane) {
     cameraOffset.copy(planeCameraBehindOffset).applyQuaternion(localPlane.quaternion);
     cameraLookOffset.copy(planeCameraLookOffset).applyQuaternion(localPlane.quaternion);
     camera.position.copy(localPlane.position).add(cameraOffset);
@@ -897,15 +833,15 @@ function sendInputTicks(frameDt) {
   net.inputAccumulator += frameDt;
   while (net.inputAccumulator >= INPUT_SEND_DT) {
     net.inputAccumulator -= INPUT_SEND_DT;
-    const buttonsBitmask = rcPlaneState.active ? 0 : buildButtonsBitmask();
+    const buttonsBitmask = buildButtonsBitmask();
     net.inputSeq += 1;
     net.socket.send(
       JSON.stringify({
         type: "input",
         seq: net.inputSeq,
         buttonsBitmask,
-        yaw: rcPlaneState.active ? 0 : player.courseYaw,
-        pitch: rcPlaneState.active ? 0 : player.pitch,
+        yaw: player.courseYaw,
+        pitch: player.pitch,
       }),
     );
     net.sentInputs += 1;
@@ -1217,207 +1153,6 @@ function togglePlaneBoarding() {
     return;
   }
   net.socket.send(JSON.stringify({ type: "toggle_vehicle" }));
-}
-
-function toggleRcPlane() {
-  if (rcPlaneState.active) {
-    parkRcPlane();
-    return;
-  }
-
-  startRcPlane(rcPlaneState.selectedType);
-}
-
-function parkRcPlane() {
-  rcPlaneState.active = false;
-  rcPlaneState.throttleUp = false;
-  rcPlaneState.throttleDown = false;
-  rcPlaneState.wasGrounded = false;
-  if (rcPlaneState.mesh) {
-    rcPlaneState.mesh.visible = false;
-  }
-  if (rcControllerState.mesh) {
-    rcControllerState.mesh.visible = false;
-  }
-  setHelpStatus("RC plane parked.", "RC Off");
-}
-
-function startRcPlane(type) {
-  if (rcPlaneState.mesh) {
-    scene.remove(rcPlaneState.mesh);
-    rcPlaneState.mesh.traverse((node) => {
-      if (node.geometry) {
-        node.geometry.dispose();
-      }
-      if (node.material) {
-        if (Array.isArray(node.material)) {
-          for (const material of node.material) {
-            material.dispose();
-          }
-        } else {
-          node.material.dispose();
-        }
-      }
-    });
-  }
-
-  rcPlaneState.selectedType = type;
-  rcPlaneState.mesh = createRcPlane(type);
-  scene.add(rcPlaneState.mesh);
-  if (!rcControllerState.mesh) {
-    rcControllerState.mesh = createRcController();
-    camera.add(rcControllerState.mesh);
-  }
-
-  const spawnX = MODEL_AIRFIELD_CENTER.x - 2;
-  const spawnZ = MODEL_AIRFIELD_CENTER.z + MODEL_AIRFIELD_RUNWAY_LENGTH * 0.3;
-  const terrainY = terrainHeight(spawnX, spawnZ);
-  rcPlaneState.position.set(spawnX, terrainY + 2.2, spawnZ);
-  rcPlaneState.velocity.set(0, 0, 0);
-  rcPlaneState.yaw = 0;
-  rcPlaneState.pitch = 0.08;
-  rcPlaneState.speed = 12;
-  rcPlaneState.throttleUp = false;
-  rcPlaneState.throttleDown = false;
-  rcPlaneState.wasGrounded = false;
-  rcPlaneState.mesh.visible = true;
-  rcControllerState.mesh.visible = true;
-  rcPlaneState.active = true;
-  const labelsByType = {
-    fighter: "RC stihacka",
-    airliner: "RC dopravni",
-    propeller: "RC vrtulak",
-  };
-  setHelpStatus(`${labelsByType[type] ?? "RC plane"} active. Use mouse and WASD. Press V to park it.`, "RC Ready");
-}
-
-function updateRcPlane(dt) {
-  if (!rcPlaneState.active || !rcPlaneState.mesh) {
-    return;
-  }
-
-  const throttleInput = (rcPlaneState.throttleUp ? 1 : 0) - (rcPlaneState.throttleDown ? 1 : 0);
-  const rollInput = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
-  const targetSpeed = THREE.MathUtils.clamp(
-    rcPlaneState.speed + throttleInput * 18 * dt,
-    RC_PLANE_MIN_SPEED,
-    RC_PLANE_MAX_SPEED,
-  );
-  rcPlaneState.speed = THREE.MathUtils.lerp(rcPlaneState.speed, targetSpeed, Math.min(1, dt * 4));
-  rcPlaneState.yaw -= rollInput * (1.45 + rcPlaneState.speed * 0.02) * dt;
-  rcPlaneState.pitch = THREE.MathUtils.clamp(rcPlaneState.pitch, -MAX_PITCH * 0.85, MAX_PITCH * 0.85);
-
-  const direction = new THREE.Vector3(
-    Math.sin(rcPlaneState.yaw) * Math.cos(rcPlaneState.pitch),
-    Math.sin(rcPlaneState.pitch),
-    -Math.cos(rcPlaneState.yaw) * Math.cos(rcPlaneState.pitch),
-  );
-  rcPlaneState.velocity.copy(direction).multiplyScalar(rcPlaneState.speed);
-  rcPlaneState.position.addScaledVector(rcPlaneState.velocity, dt);
-
-  const terrainY = terrainHeight(rcPlaneState.position.x, rcPlaneState.position.z);
-  rcPlaneState.position.x = THREE.MathUtils.clamp(rcPlaneState.position.x, -WORLD_SIZE * 0.5 + 4, WORLD_SIZE * 0.5 - 4);
-  rcPlaneState.position.z = THREE.MathUtils.clamp(rcPlaneState.position.z, -WORLD_SIZE * 0.5 + 4, WORLD_SIZE * 0.5 - 4);
-  rcPlaneState.position.y = THREE.MathUtils.clamp(
-    rcPlaneState.position.y,
-    terrainY + RC_PLANE_MIN_ALTITUDE,
-    terrainY + RC_PLANE_MAX_ALTITUDE,
-  );
-  const grounded = rcPlaneState.position.y <= terrainY + RC_PLANE_MIN_ALTITUDE + 0.02;
-  if (grounded && !rcPlaneState.wasGrounded) {
-    createTouchdownSmoke(rcPlaneState.position.x, terrainY, rcPlaneState.position.z, rcPlaneState.yaw, 0.35);
-  }
-  rcPlaneState.wasGrounded = grounded;
-  if (grounded) {
-    rcPlaneState.pitch = Math.max(0.04, rcPlaneState.pitch);
-  }
-
-  rcPlaneState.mesh.position.copy(rcPlaneState.position);
-  rcPlaneState.mesh.rotation.set(0, -rcPlaneState.yaw, 0, "YXZ");
-  rcPlaneState.mesh.rotateY(Math.PI / 2);
-  rcPlaneState.mesh.rotateZ(rcPlaneState.pitch * 0.45 - rollInput * 0.2);
-  setAircraftGearDeployed(rcPlaneState.mesh, grounded || (rcPlaneState.position.y - terrainY) <= 5.5);
-}
-
-function createRcPlane(type = "fighter") {
-  let plane;
-  if (type === "airliner") {
-    plane = createAirliner({
-      body: 0xe7edf6,
-      accent: 0x2a5f94,
-    });
-    plane.scale.setScalar(0.16);
-  } else if (type === "propeller") {
-    plane = createPersonalPlane({
-      body: 0xf5f06c,
-      accent: 0x1d2430,
-      scale: 0.16,
-      controlledLights: true,
-    });
-  } else {
-    plane = createConcorde({
-      body: 0xd7dde4,
-      accent: 0xc83a32,
-      scale: 0.15,
-    });
-  }
-  plane.visible = false;
-  return plane;
-}
-
-function createRcController() {
-  const controller = new THREE.Group();
-
-  const body = new THREE.Mesh(
-    new THREE.BoxGeometry(0.36, 0.14, 0.22),
-    new THREE.MeshStandardMaterial({
-      color: 0x1e242c,
-      roughness: 0.62,
-      metalness: 0.18,
-    }),
-  );
-  controller.add(body);
-
-  for (const x of [-0.08, 0.08]) {
-    const stickBase = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.028, 0.028, 0.02, 12),
-      new THREE.MeshStandardMaterial({
-        color: 0x2a323c,
-        roughness: 0.5,
-        metalness: 0.18,
-      }),
-    );
-    stickBase.position.set(x, 0.075, 0.015);
-    controller.add(stickBase);
-
-    const stick = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.01, 0.01, 0.08, 10),
-      new THREE.MeshStandardMaterial({
-        color: 0xc5ccd6,
-        roughness: 0.35,
-        metalness: 0.3,
-      }),
-    );
-    stick.position.set(x, 0.11, 0.015);
-    controller.add(stick);
-  }
-
-  const antenna = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.006, 0.006, 0.22, 10),
-    new THREE.MeshStandardMaterial({
-      color: 0xd7dbe2,
-      roughness: 0.28,
-      metalness: 0.42,
-    }),
-  );
-  antenna.position.set(0, 0.17, -0.06);
-  antenna.rotation.x = 0.28;
-  controller.add(antenna);
-
-  controller.position.set(0.34, -0.28, -0.72);
-  controller.rotation.set(-0.32, -0.24, 0.08);
-  controller.visible = false;
-  return controller;
 }
 
 function getOrCreatePlayerAvatar(playerId) {
@@ -2372,10 +2107,6 @@ function terrainHeight(x, z) {
   if (airportOverride !== null) {
     return airportOverride;
   }
-  const modelAirfieldOverride = modelAirfieldTerrainOverride(x, z);
-  if (modelAirfieldOverride !== null) {
-    return modelAirfieldOverride;
-  }
 
   const distanceFromCenter = Math.hypot(x, z);
   const centerRadius = WORLD_SIZE * 0.2;
@@ -2434,26 +2165,6 @@ function airportTerrainOverride(x, z) {
 
 function airportBaseTerrainHeight() {
   return terrainNoiseHeight(AIRPORT_CENTER.x, AIRPORT_CENTER.z) + 0.22;
-}
-
-function modelAirfieldTerrainOverride(x, z) {
-  const dx = x - MODEL_AIRFIELD_CENTER.x;
-  const dz = z - MODEL_AIRFIELD_CENTER.z;
-  const nx = Math.abs(dx) / MODEL_AIRFIELD_FLATTEN_RADIUS_X;
-  const nz = Math.abs(dz) / MODEL_AIRFIELD_FLATTEN_RADIUS_Z;
-  const envelope = Math.max(nx, nz);
-  if (envelope >= 1.12) {
-    return null;
-  }
-
-  const baseTerrain = modelAirfieldBaseTerrainHeight();
-  const edgeBlend = THREE.MathUtils.clamp((envelope - 0.78) / 0.34, 0, 1);
-  const naturalTerrain = terrainNoiseHeight(x, z);
-  return THREE.MathUtils.lerp(baseTerrain, naturalTerrain, smoothstep(edgeBlend));
-}
-
-function modelAirfieldBaseTerrainHeight() {
-  return terrainNoiseHeight(MODEL_AIRFIELD_CENTER.x, MODEL_AIRFIELD_CENTER.z) + 0.12;
 }
 
 function terrainNoiseHeight(x, z) {
@@ -2843,122 +2554,6 @@ function createAirport() {
   });
 
   scene.add(airport);
-}
-
-function createModelAirfield() {
-  const airfield = new THREE.Group();
-  const runwayY = terrainHeight(MODEL_AIRFIELD_CENTER.x, MODEL_AIRFIELD_CENTER.z) + 0.03;
-  const prepAreaCenter = { x: MODEL_AIRFIELD_CENTER.x - 11, z: MODEL_AIRFIELD_CENTER.z + 12 };
-
-  const grassPad = new THREE.Mesh(
-    new THREE.BoxGeometry(MODEL_AIRFIELD_RUNWAY_WIDTH + 18, 0.1, MODEL_AIRFIELD_RUNWAY_LENGTH + 16),
-    new THREE.MeshStandardMaterial({
-      color: 0x6f8459,
-      roughness: 1,
-      metalness: 0,
-    }),
-  );
-  grassPad.position.set(MODEL_AIRFIELD_CENTER.x, runwayY - 0.05, MODEL_AIRFIELD_CENTER.z);
-  grassPad.receiveShadow = true;
-  airfield.add(grassPad);
-
-  const runway = new THREE.Mesh(
-    new THREE.BoxGeometry(MODEL_AIRFIELD_RUNWAY_WIDTH, 0.08, MODEL_AIRFIELD_RUNWAY_LENGTH),
-    new THREE.MeshStandardMaterial({
-      color: 0x31363b,
-      roughness: 0.92,
-      metalness: 0.02,
-    }),
-  );
-  runway.position.set(MODEL_AIRFIELD_CENTER.x, runwayY, MODEL_AIRFIELD_CENTER.z);
-  runway.receiveShadow = true;
-  airfield.add(runway);
-
-  const centerStripeMaterial = new THREE.MeshStandardMaterial({
-    color: 0xf1edd5,
-    roughness: 0.74,
-    metalness: 0.02,
-  });
-  for (let i = -2; i <= 2; i += 1) {
-    if (i === 0) {
-      continue;
-    }
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.03, 4.2), centerStripeMaterial);
-    stripe.position.set(MODEL_AIRFIELD_CENTER.x, runwayY + 0.055, MODEL_AIRFIELD_CENTER.z + i * 8);
-    airfield.add(stripe);
-  }
-
-  const prepArea = new THREE.Mesh(
-    new THREE.BoxGeometry(16, 0.08, 10),
-    new THREE.MeshStandardMaterial({
-      color: 0x767d80,
-      roughness: 0.88,
-      metalness: 0.03,
-    }),
-  );
-  prepArea.position.set(prepAreaCenter.x, runwayY - 0.01, prepAreaCenter.z);
-  prepArea.receiveShadow = true;
-  airfield.add(prepArea);
-
-  const shelter = new THREE.Mesh(
-    new THREE.BoxGeometry(7, 2.8, 3.6),
-    new THREE.MeshStandardMaterial({
-      color: 0xc7c1b2,
-      roughness: 0.68,
-      metalness: 0.06,
-    }),
-  );
-  shelter.position.set(prepAreaCenter.x - 1.4, runwayY + 1.4, prepAreaCenter.z - 6.4);
-  shelter.castShadow = true;
-  shelter.receiveShadow = true;
-  airfield.add(shelter);
-
-  const roof = new THREE.Mesh(
-    new THREE.BoxGeometry(8, 0.18, 4.4),
-    new THREE.MeshStandardMaterial({
-      color: 0x84443a,
-      roughness: 0.55,
-      metalness: 0.12,
-    }),
-  );
-  roof.position.set(prepAreaCenter.x - 1.4, runwayY + 2.95, prepAreaCenter.z - 6.4);
-  roof.rotation.z = 0.04;
-  roof.castShadow = true;
-  airfield.add(roof);
-
-  for (const side of [-1, 1]) {
-    const windsockPole = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.08, 0.08, 3.8, 10),
-      new THREE.MeshStandardMaterial({
-        color: 0xd3d7dc,
-        roughness: 0.34,
-        metalness: 0.36,
-      }),
-    );
-    windsockPole.position.set(MODEL_AIRFIELD_CENTER.x + side * 8.5, runwayY + 1.9, MODEL_AIRFIELD_CENTER.z - 20);
-    airfield.add(windsockPole);
-
-    const windsock = new THREE.Mesh(
-      new THREE.ConeGeometry(0.24, 1.7, 10),
-      new THREE.MeshStandardMaterial({
-        color: side < 0 ? 0xe05c43 : 0xf0f3f7,
-        roughness: 0.58,
-        metalness: 0.04,
-      }),
-    );
-    windsock.rotation.z = Math.PI / 2;
-    windsock.rotation.y = side < 0 ? Math.PI : 0;
-    windsock.position.set(MODEL_AIRFIELD_CENTER.x + side * 8.5, runwayY + 3.25, MODEL_AIRFIELD_CENTER.z - 19.5);
-    airfield.add(windsock);
-  }
-
-  const parkedRc = createRcPlane("propeller");
-  parkedRc.visible = true;
-  parkedRc.position.set(prepAreaCenter.x + 3.8, runwayY + 0.06, prepAreaCenter.z + 1.4);
-  parkedRc.rotation.y = Math.PI * 0.18;
-  airfield.add(parkedRc);
-
-  scene.add(airfield);
 }
 
 function updateDayNightCycle(elapsedTime) {
@@ -3872,7 +3467,6 @@ function createForest() {
 
   const blockedTreeZones = [
     { minX: AIRPORT_CENTER.x - 95, maxX: AIRPORT_CENTER.x + 80, minZ: AIRPORT_CENTER.z - 155, maxZ: AIRPORT_CENTER.z + 80 },
-    { minX: MODEL_AIRFIELD_CENTER.x - 55, maxX: MODEL_AIRFIELD_CENTER.x + 55, minZ: MODEL_AIRFIELD_CENTER.z - 78, maxZ: MODEL_AIRFIELD_CENTER.z + 72 },
     { minX: CITY_CENTER.x - 44, maxX: CITY_CENTER.x + 44, minZ: CITY_CENTER.z - 52, maxZ: CITY_CENTER.z + 72 },
     { minX: -WORLD_SIZE * 0.5 - 20, maxX: WORLD_SIZE * 0.5 + 20, minZ: RAILWAY_Z - 8, maxZ: RAILWAY_Z + 16 },
     { minX: RAILWAY_STATION_X - 16, maxX: RAILWAY_STATION_X + 16, minZ: RAILWAY_Z - 36, maxZ: RAILWAY_Z - 2 },
@@ -5075,17 +4669,24 @@ function updateAirportTraffic(elapsedTime, dt = 0.016) {
 
     if (plane.state === "taxiToPark") {
       const taxiSpeed = plane.taxiToParkSpeed || AIRPORT_AI_TAXI_TO_PARK_SPEED;
-      const targetReached = moveAirportPlaneTowards(
+      const taxiAxis = plane.taxiAxis === "z" ? "z" : "x";
+      const targetReached = moveAirportPlaneAxisAligned(
         plane,
         plane.parkingX,
         plane.parkingY,
         plane.parkingZ,
         taxiSpeed,
         delta,
+        taxiAxis,
       );
 
+      if (targetReached && taxiAxis === "x") {
+        plane.taxiAxis = "z";
+        setAircraftGearDeployed(plane.mesh, true);
+        continue;
+      }
+
       if (!targetReached) {
-        plane.mesh.rotation.set(0, plane.parkingYaw, 0, "YXZ");
         setAircraftGearDeployed(plane.mesh, true);
         continue;
       }
@@ -5096,6 +4697,7 @@ function updateAirportTraffic(elapsedTime, dt = 0.016) {
       plane.mesh.rotation.set(0, plane.parkingYaw, 0, "YXZ");
       plane.wasOnRunway = false;
       setAircraftGearDeployed(plane.mesh, true);
+      plane.taxiAxis = "x";
       plane.runwayTurnState = "idle";
       if (airportDepartureInProgress === plane) {
         airportDepartureInProgress = null;
@@ -5301,7 +4903,7 @@ function sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth)
   if (cycle < 0.28) {
     const t = cycle / 0.28;
     z = THREE.MathUtils.lerp(thresholdNorth - plane.approachDistance, thresholdNorth, t);
-    altitude = THREE.MathUtils.lerp(plane.cruiseAltitude, 1.6, smoothstep(t));
+    altitude = THREE.MathUtils.lerp(plane.cruiseAltitude, 1.6, t);
   } else if (cycle < 0.46) {
     const t = (cycle - 0.28) / 0.18;
     z = THREE.MathUtils.lerp(thresholdNorth, thresholdSouth - 16, t);
@@ -5313,7 +4915,7 @@ function sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth)
   } else if (cycle < 0.78) {
     const t = (cycle - 0.56) / 0.22;
     z = THREE.MathUtils.lerp(thresholdSouth, thresholdSouth + plane.departureDistance, t);
-    altitude = THREE.MathUtils.lerp(2.4, plane.cruiseAltitude, smoothstep(t));
+    altitude = THREE.MathUtils.lerp(2.4, plane.cruiseAltitude, t);
   } else {
     const t = (cycle - 0.78) / 0.22;
     worldX = x;

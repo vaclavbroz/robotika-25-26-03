@@ -641,17 +641,23 @@ function updateAirportAirTraffic(dtSeconds) {
 
   for (const plane of SIMULATION_CONFIG.airportAirliners) {
     if (plane.state === "taxiToPark") {
-      const targetReached = moveAirportPlaneTowards(
+      const taxiAxis = plane.taxiAxis === "z" ? "z" : "x";
+      const targetReached = moveAirportPlaneAxisAligned(
         plane,
         plane.parkingX,
         plane.parkingY,
         plane.parkingZ,
         plane.taxiToParkSpeed || AIRPORT_AI_TAXI_TO_PARK_SPEED,
         delta,
+        taxiAxis,
       );
       plane.pitch = 0;
       plane.onGround = true;
       plane.altitude = plane.parkingY - AIRPORT_RUNWAY_WORLD_Y;
+      if (targetReached && taxiAxis === "x") {
+        plane.taxiAxis = "z";
+        continue;
+      }
       if (targetReached) {
         plane.state = "holding";
         plane.holdRemaining = plane.parkHoldSeconds ?? AIRPORT_AI_PARK_HOLD_SECONDS;
@@ -659,6 +665,7 @@ function updateAirportAirTraffic(dtSeconds) {
         plane.y = plane.parkingY;
         plane.z = plane.parkingZ;
         plane.yaw = plane.parkingYaw;
+        plane.taxiAxis = "x";
         plane.runwayTurnState = "idle";
         plane.wasOnRunway = false;
         if (airportDepartureInProgress === plane) {
@@ -762,7 +769,7 @@ function updateAirportAirTraffic(dtSeconds) {
     plane.altitude = sample.y;
     plane.y = AIRPORT_RUNWAY_WORLD_Y + sample.y;
     plane.z = sample.z;
-    plane.yaw = yaw - Math.PI / 2;
+    plane.yaw = yaw;
     plane.pitch = pitch * 0.35;
     plane.velocityX = delta > 0 ? dx / delta : 0;
     plane.velocityY = delta > 0 ? dy / delta : 0;
@@ -790,12 +797,50 @@ function updateAirportAirTraffic(dtSeconds) {
         plane.departureAirborneReleased = true;
       }
       plane.state = "taxiToPark";
+      plane.taxiAxis = "x";
       plane.holdRemaining = 0;
       plane.yaw = plane.parkingYaw;
       plane.pitch = 0;
       plane.wasOnRunway = false;
     }
   }
+}
+
+function moveAirportPlaneAxisAligned(plane, targetX, targetY, targetZ, speed, dt, axis) {
+  const dx = targetX - plane.x;
+  const dy = targetY - plane.y;
+  const dz = targetZ - plane.z;
+  const moveX = axis === "x" ? dx : 0;
+  const moveY = dy;
+  const moveZ = axis === "z" ? dz : 0;
+  const distance = Math.hypot(moveX, moveY, moveZ);
+  if (distance <= 0.22) {
+    plane.x = axis === "x" ? targetX : plane.x;
+    plane.y = targetY;
+    plane.z = axis === "z" ? targetZ : plane.z;
+    plane.velocityX = 0;
+    plane.velocityY = 0;
+    plane.velocityZ = 0;
+    return true;
+  }
+
+  const move = Math.max(0, speed * dt);
+  if (move <= 0) {
+    return false;
+  }
+  const step = Math.min(move, distance);
+  const invDistance = 1 / Math.max(distance, 0.0001);
+  const stepX = moveX * invDistance * step;
+  const stepY = moveY * invDistance * step;
+  const stepZ = moveZ * invDistance * step;
+  plane.x += stepX;
+  plane.y += stepY;
+  plane.z += stepZ;
+  plane.velocityX = dt > 0 ? stepX / dt : 0;
+  plane.velocityY = dt > 0 ? stepY / dt : 0;
+  plane.velocityZ = dt > 0 ? stepZ / dt : 0;
+  plane.yaw = Math.atan2(moveX, moveZ);
+  return false;
 }
 
 function moveAirportPlaneTowards(plane, targetX, targetY, targetZ, speed, dt, fixedYaw = null) {
@@ -843,7 +888,7 @@ function sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth)
   if (cycle < 0.28) {
     const t = cycle / 0.28;
     z = lerp(thresholdNorth - plane.approachDistance, thresholdNorth, t);
-    altitude = lerp(plane.cruiseAltitude, 1.6, smoothstep(t));
+    altitude = lerp(plane.cruiseAltitude, 1.6, t);
   } else if (cycle < 0.46) {
     const t = (cycle - 0.28) / 0.18;
     z = lerp(thresholdNorth, thresholdSouth - 16, t);
@@ -855,7 +900,7 @@ function sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth)
   } else if (cycle < 0.78) {
     const t = (cycle - 0.56) / 0.22;
     z = lerp(thresholdSouth, thresholdSouth + plane.departureDistance, t);
-    altitude = lerp(2.4, plane.cruiseAltitude, smoothstep(t));
+    altitude = lerp(2.4, plane.cruiseAltitude, t);
   } else {
     const t = (cycle - 0.78) / 0.22;
     z = lerp(thresholdSouth + plane.departureDistance, thresholdNorth - plane.approachDistance, t);

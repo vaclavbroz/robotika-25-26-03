@@ -10,6 +10,16 @@ const TICK_HZ = 20;
 const tickMs = Math.round(1000 / TICK_HZ);
 const SIM_DT_SECONDS = 1 / TICK_HZ;
 const SNAPSHOT_INTERVAL_TICKS = TICK_HZ;
+const AIRPORT_CENTER = { x: 122, z: -88 };
+const AIRPORT_RUNWAY_LENGTH = 118;
+const AIRPORT_RUNWAY_WIDTH = 24;
+const AIRPORT_AI_PARK_HOLD_SECONDS = 30;
+const AIRPORT_AI_TAXI_TO_PARK_SPEED = 10;
+const AIRPORT_AI_TAXI_TO_RUNWAY_SPEED = 11;
+const AIRPORT_AI_TAKEOFF_AIRBORNE_ALTITUDE = 4.5;
+const AIRPORT_AI_DEPARTURE_CYCLE_START = 0.56;
+const AIRPORT_AIRLINER_BOARDING_RADIUS = 8;
+const AIRPORT_RUNWAY_WORLD_Y = 0.22;
 const INPUT_BUTTON_JUMP = 1 << 0;
 const INPUT_BUTTON_FORWARD = 1 << 1;
 const INPUT_BUTTON_BACKWARD = 1 << 2;
@@ -23,6 +33,53 @@ const SIM_BUS_ROUTE = [
   { x: -90, z: -36, stop: { duration: 2.4 } },
   { x: -34, z: -36, stop: { duration: 3.0 } },
   { x: -34, z: 146 },
+];
+const SIM_AIRPORT_TRAFFIC_CONFIGS = [
+  {
+    id: "airliner-0",
+    runwayOffsetX: -3.2,
+    cycleDuration: 40,
+    phase: 0.0,
+    cruiseAltitude: 34,
+    approachDistance: 124,
+    departureDistance: 158,
+  },
+  {
+    id: "airliner-1",
+    runwayOffsetX: 3.4,
+    cycleDuration: 40,
+    phase: 0.2,
+    cruiseAltitude: 42,
+    approachDistance: 142,
+    departureDistance: 176,
+  },
+  {
+    id: "airliner-2",
+    runwayOffsetX: -1.4,
+    cycleDuration: 40,
+    phase: 0.4,
+    cruiseAltitude: 30,
+    approachDistance: 116,
+    departureDistance: 150,
+  },
+  {
+    id: "airliner-3",
+    runwayOffsetX: 1.6,
+    cycleDuration: 40,
+    phase: 0.6,
+    cruiseAltitude: 38,
+    approachDistance: 136,
+    departureDistance: 168,
+  },
+  {
+    id: "airliner-4",
+    runwayOffsetX: 0,
+    cycleDuration: 40,
+    phase: 0.8,
+    cruiseAltitude: 46,
+    approachDistance: 156,
+    departureDistance: 188,
+  },
 ];
 const SIMULATION_CONFIG = {
   gravity: 24.0,
@@ -40,8 +97,8 @@ const SIMULATION_CONFIG = {
   playerCollisionRestitution: 0.93,
   playerCollisionIterations: 3,
   parkedPlane: {
-    x: 122,
-    z: -88,
+    x: AIRPORT_CENTER.x,
+    z: AIRPORT_CENTER.z,
     boardingRadius: 16,
   },
   parkedCar: {
@@ -51,10 +108,10 @@ const SIMULATION_CONFIG = {
     boardingRadius: 12,
   },
   runway: {
-    centerX: 122,
-    centerZ: -88,
-    width: 24,
-    length: 118,
+    centerX: AIRPORT_CENTER.x,
+    centerZ: AIRPORT_CENTER.z,
+    width: AIRPORT_RUNWAY_WIDTH,
+    length: AIRPORT_RUNWAY_LENGTH,
   },
   planeMinAltitude: 1.6,
   planeCruiseSpeed: 18,
@@ -114,6 +171,7 @@ const SIMULATION_CONFIG = {
     yaw: Math.PI,
     boardingRadius: 6.2,
   },
+  airportAirliners: createAirportAirliners(),
 };
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PORT = Number(process.env.PORT || 9003);
@@ -128,6 +186,9 @@ const world = new WorldState();
 
 const socketsByPlayerId = new Map();
 const lastSentPlayerStateById = new Map();
+let airportDepartureInProgress = null;
+let airportElapsedTime = 0;
+let lastSentAirportTrafficState = "";
 
 const server = createServer((req, res) => {
   if (req.url === "/health") {
@@ -174,6 +235,7 @@ server.listen(PORT, HOST, () => {
 
 const simulationTimer = setInterval(() => {
   updateBusMotion(SIM_DT_SECONDS);
+  updateAirportAirTraffic(SIM_DT_SECONDS);
   world.simulateTick(SIM_DT_SECONDS, SIMULATION_CONFIG);
   broadcastReplicationUpdate();
   broadcastCollisionEvents();
@@ -274,6 +336,9 @@ function cleanupPlayerSession(connection) {
 }
 
 function broadcastReplicationUpdate() {
+  const airportTraffic = serializeAirportTraffic();
+  const serializedAirportTraffic = JSON.stringify(airportTraffic);
+
   if (world.tick % SNAPSHOT_INTERVAL_TICKS === 0) {
     const snapshot = createReplicationSnapshot();
     for (const state of snapshot.players) {
@@ -287,7 +352,9 @@ function broadcastReplicationUpdate() {
       tick: snapshot.tick,
       players: snapshot.players,
       parkedCar: snapshot.parkedCar,
+      airportTraffic: snapshot.airportTraffic,
     });
+    lastSentAirportTrafficState = serializedAirportTraffic;
     return;
   }
 
@@ -301,15 +368,19 @@ function broadcastReplicationUpdate() {
     changedPlayers.push(player);
   }
 
-  if (changedPlayers.length === 0) {
+  const airportTrafficChanged = serializedAirportTraffic !== lastSentAirportTrafficState;
+  if (changedPlayers.length === 0 && !airportTrafficChanged) {
     return;
   }
+
+  lastSentAirportTrafficState = serializedAirportTraffic;
 
   broadcastJson({
     type: "delta",
     tick: world.tick,
     players: changedPlayers,
     parkedCar: serializeParkedCar(),
+    airportTraffic,
   });
 }
 
@@ -318,6 +389,7 @@ function createReplicationSnapshot() {
   return {
     ...snapshot,
     parkedCar: serializeParkedCar(),
+    airportTraffic: serializeAirportTraffic(),
   };
 }
 
@@ -333,6 +405,22 @@ function serializeParkedCar() {
     yaw: Number.isFinite(parkedCar.yaw) ? parkedCar.yaw : 0,
     boardingRadius: Number(parkedCar.boardingRadius) || 12,
   };
+}
+
+function serializeAirportTraffic() {
+  return Array.isArray(SIMULATION_CONFIG.airportAirliners)
+    ? SIMULATION_CONFIG.airportAirliners.map((plane) => ({
+        id: plane.id,
+        state: plane.state,
+        x: Number(plane.x) || 0,
+        y: Number(plane.y) || 0,
+        z: Number(plane.z) || 0,
+        yaw: Number.isFinite(plane.yaw) ? plane.yaw : 0,
+        pitch: Number.isFinite(plane.pitch) ? plane.pitch : 0,
+        onGround: plane.onGround === true,
+        boardingRadius: Number.isFinite(plane.boardingRadius) ? plane.boardingRadius : AIRPORT_AIRLINER_BOARDING_RADIUS,
+      }))
+    : [];
 }
 
 function broadcastCollisionEvents() {
@@ -470,6 +558,319 @@ function onFrame(connection, opcode, payload) {
       player.triggerPlaneCrash("air-traffic-collision");
     }
   }
+}
+
+function createAirportAirliners() {
+  const parkingAltitude = 1.6;
+  const runwayY = AIRPORT_RUNWAY_WORLD_Y + parkingAltitude;
+  const parkingYaw = -Math.PI / 2;
+  const parkingStands = buildAirportParkStands(SIM_AIRPORT_TRAFFIC_CONFIGS.length);
+  return SIM_AIRPORT_TRAFFIC_CONFIGS.map((planeConfig, index) => {
+    const parking = parkingStands[index];
+    return {
+      ...planeConfig,
+      state: "approach",
+      parkingX: parking.x,
+      parkingY: runwayY,
+      parkingZ: parking.z,
+      parkingYaw,
+      departureAirborneReleased: false,
+      holdRemaining: 0,
+      parkHoldSeconds: AIRPORT_AI_PARK_HOLD_SECONDS,
+      taxiToParkSpeed: AIRPORT_AI_TAXI_TO_PARK_SPEED,
+      taxiToRunwaySpeed: AIRPORT_AI_TAXI_TO_RUNWAY_SPEED,
+      takeoffStartTime: 0,
+      runwayAlignedX: AIRPORT_CENTER.x + planeConfig.runwayOffsetX,
+      runwayTurnState: "idle",
+      boardingRadius: AIRPORT_AIRLINER_BOARDING_RADIUS,
+      x: AIRPORT_CENTER.x + planeConfig.runwayOffsetX,
+      y: AIRPORT_RUNWAY_WORLD_Y + planeConfig.cruiseAltitude,
+      altitude: planeConfig.cruiseAltitude,
+      z: AIRPORT_CENTER.z - AIRPORT_RUNWAY_LENGTH * 0.5 - planeConfig.approachDistance + 8,
+      yaw: Math.PI,
+      pitch: 0,
+      velocityX: 0,
+      velocityY: 0,
+      velocityZ: 0,
+      onGround: false,
+      wasOnRunway: false,
+    };
+  });
+}
+
+function buildAirportParkStands(count) {
+  const stands = [];
+  const runwayLeftX = AIRPORT_CENTER.x - AIRPORT_RUNWAY_WIDTH * 0.5 - 8;
+  const standStartZ = AIRPORT_CENTER.z + AIRPORT_RUNWAY_LENGTH * 0.5 - 14;
+  const standSpacingZ = 16;
+  const terminalBounds = {
+    xMin: AIRPORT_CENTER.x - 43,
+    xMax: AIRPORT_CENTER.x - 15,
+    zMin: AIRPORT_CENTER.z + 5,
+    zMax: AIRPORT_CENTER.z + 19,
+  };
+
+  for (let i = 0; i < count; i += 1) {
+    const x = runwayLeftX;
+    let z = standStartZ - i * standSpacingZ;
+    let attempts = 0;
+    while (
+      x >= terminalBounds.xMin &&
+      x <= terminalBounds.xMax &&
+      z >= terminalBounds.zMin &&
+      z <= terminalBounds.zMax &&
+      attempts < 30
+    ) {
+      z -= standSpacingZ;
+      attempts += 1;
+    }
+    stands.push({ x, z });
+  }
+
+  return stands;
+}
+
+function updateAirportAirTraffic(dtSeconds) {
+  const thresholdNorth = AIRPORT_CENTER.z - AIRPORT_RUNWAY_LENGTH * 0.5 + 8;
+  const thresholdSouth = AIRPORT_CENTER.z + AIRPORT_RUNWAY_LENGTH * 0.5 - 8;
+  const runwayBaseY = 0;
+  const delta = Math.max(0, dtSeconds);
+  const runwayEndZ = AIRPORT_CENTER.z + AIRPORT_RUNWAY_LENGTH * 0.5 - 1.2;
+  const runwayEndOffset = runwayEndZ - thresholdSouth;
+  airportElapsedTime += delta;
+
+  for (const plane of SIMULATION_CONFIG.airportAirliners) {
+    if (plane.state === "taxiToPark") {
+      const targetReached = moveAirportPlaneTowards(
+        plane,
+        plane.parkingX,
+        plane.parkingY,
+        plane.parkingZ,
+        plane.taxiToParkSpeed || AIRPORT_AI_TAXI_TO_PARK_SPEED,
+        delta,
+      );
+      plane.pitch = 0;
+      plane.onGround = true;
+      plane.altitude = plane.parkingY - AIRPORT_RUNWAY_WORLD_Y;
+      if (targetReached) {
+        plane.state = "holding";
+        plane.holdRemaining = plane.parkHoldSeconds ?? AIRPORT_AI_PARK_HOLD_SECONDS;
+        plane.x = plane.parkingX;
+        plane.y = plane.parkingY;
+        plane.z = plane.parkingZ;
+        plane.yaw = plane.parkingYaw;
+        plane.runwayTurnState = "idle";
+        plane.wasOnRunway = false;
+        if (airportDepartureInProgress === plane) {
+          airportDepartureInProgress = null;
+        }
+      }
+      continue;
+    }
+
+    if (plane.state === "taxiToRunway") {
+      const runwayAlignedX = plane.runwayAlignedX ?? (AIRPORT_CENTER.x + plane.runwayOffsetX);
+      const isAligningRunway = plane.runwayTurnState !== "downRunway";
+      const targetX = runwayAlignedX;
+      const targetZ = isAligningRunway ? plane.parkingZ : runwayEndZ;
+      const targetYaw = isAligningRunway ? plane.parkingYaw + Math.PI / 2 : plane.parkingYaw;
+      const targetReached = moveAirportPlaneTowards(
+        plane,
+        targetX,
+        plane.parkingY,
+        targetZ,
+        plane.taxiToRunwaySpeed || AIRPORT_AI_TAXI_TO_RUNWAY_SPEED,
+        delta,
+        targetYaw,
+      );
+      plane.pitch = 0;
+      plane.onGround = true;
+      plane.altitude = plane.y - AIRPORT_RUNWAY_WORLD_Y;
+      if (!targetReached) {
+        plane.yaw = targetYaw;
+        continue;
+      }
+      if (isAligningRunway) {
+        if (airportDepartureInProgress !== plane) {
+          plane.runwayTurnState = "runwayQueued";
+          plane.yaw = targetYaw;
+          continue;
+        }
+        plane.runwayTurnState = "downRunway";
+        continue;
+      }
+
+      plane.state = "departing";
+      plane.takeoffStartTime = airportElapsedTime;
+      plane.departureAirborneReleased = false;
+      plane.wasOnRunway = false;
+      plane.runwayTurnState = "idle";
+      continue;
+    }
+
+    if (plane.state === "holding") {
+      plane.holdRemaining -= delta;
+      plane.x = plane.parkingX;
+      plane.y = plane.parkingY;
+      plane.z = plane.parkingZ;
+      plane.yaw = plane.parkingYaw;
+      plane.pitch = 0;
+      plane.velocityX = 0;
+      plane.velocityY = 0;
+      plane.velocityZ = 0;
+      plane.onGround = true;
+      plane.altitude = plane.parkingY - AIRPORT_RUNWAY_WORLD_Y;
+      if (plane.holdRemaining <= 0 && !airportDepartureInProgress) {
+        plane.state = "taxiToRunway";
+        plane.takeoffStartTime = airportElapsedTime;
+        plane.runwayTurnState = "alignToRunway";
+        airportDepartureInProgress = plane;
+      }
+      continue;
+    }
+
+    if (plane.state === "departing" && airportElapsedTime >= plane.takeoffStartTime + plane.cycleDuration) {
+      if (airportDepartureInProgress === plane) {
+        airportDepartureInProgress = null;
+      }
+      plane.state = "approach";
+    }
+
+    const departureProgress = (airportElapsedTime - plane.takeoffStartTime) / plane.cycleDuration;
+    const cycle = plane.state === "departing"
+      ? AIRPORT_AI_DEPARTURE_CYCLE_START + Math.max(0, Math.min(1, departureProgress)) * (1 - AIRPORT_AI_DEPARTURE_CYCLE_START)
+      : ((airportElapsedTime / plane.cycleDuration) + plane.phase) % 1;
+    const sample = sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth);
+    const nextTime = airportElapsedTime + delta;
+    const nextDepartureProgress = (nextTime - plane.takeoffStartTime) / plane.cycleDuration;
+    const nextCycle = plane.state === "departing"
+      ? AIRPORT_AI_DEPARTURE_CYCLE_START + Math.max(0, Math.min(1, nextDepartureProgress)) * (1 - AIRPORT_AI_DEPARTURE_CYCLE_START)
+      : ((nextTime / plane.cycleDuration) + plane.phase) % 1;
+    const nextSample = sampleAirportTrafficState(plane, nextCycle, thresholdNorth, thresholdSouth);
+    if (plane.state === "departing") {
+      sample.z += runwayEndOffset;
+      nextSample.z += runwayEndOffset;
+    }
+
+    const dx = nextSample.x - sample.x;
+    const dy = nextSample.y - sample.y;
+    const dz = nextSample.z - sample.z;
+    const horizontalLength = Math.hypot(dx, dz);
+    const yaw = Math.atan2(dx, dz);
+    const pitch = Math.atan2(dy, Math.max(0.001, horizontalLength));
+    plane.x = sample.x;
+    plane.altitude = sample.y;
+    plane.y = AIRPORT_RUNWAY_WORLD_Y + sample.y;
+    plane.z = sample.z;
+    plane.yaw = yaw - Math.PI / 2;
+    plane.pitch = pitch * 0.35;
+    plane.velocityX = delta > 0 ? dx / delta : 0;
+    plane.velocityY = delta > 0 ? dy / delta : 0;
+    plane.velocityZ = delta > 0 ? dz / delta : 0;
+    plane.onGround = sample.y <= runwayBaseY + 1.62;
+
+    if (
+      plane.state === "departing" &&
+      airportDepartureInProgress === plane &&
+      !plane.departureAirborneReleased &&
+      sample.y - runwayBaseY >= AIRPORT_AI_TAKEOFF_AIRBORNE_ALTITUDE
+    ) {
+      airportDepartureInProgress = null;
+      plane.departureAirborneReleased = true;
+    }
+
+    if (
+      plane.state === "approach" &&
+      sample.z >= thresholdSouth - 8 &&
+      sample.z <= thresholdSouth + 6 &&
+      sample.y <= runwayBaseY + 2.8
+    ) {
+      if (!airportDepartureInProgress) {
+        airportDepartureInProgress = plane;
+        plane.departureAirborneReleased = true;
+      }
+      plane.state = "taxiToPark";
+      plane.holdRemaining = 0;
+      plane.yaw = plane.parkingYaw;
+      plane.pitch = 0;
+      plane.wasOnRunway = false;
+    }
+  }
+}
+
+function moveAirportPlaneTowards(plane, targetX, targetY, targetZ, speed, dt, fixedYaw = null) {
+  const dx = targetX - plane.x;
+  const dy = targetY - plane.y;
+  const dz = targetZ - plane.z;
+  const distance = Math.hypot(dx, dy, dz);
+  if (distance <= 0.22) {
+    plane.x = targetX;
+    plane.y = targetY;
+    plane.z = targetZ;
+    plane.velocityX = 0;
+    plane.velocityY = 0;
+    plane.velocityZ = 0;
+    if (fixedYaw !== null) {
+      plane.yaw = fixedYaw;
+    }
+    return true;
+  }
+
+  const move = Math.max(0, speed * dt);
+  if (move <= 0) {
+    return false;
+  }
+  const step = Math.min(move, distance);
+  const invDistance = 1 / Math.max(distance, 0.0001);
+  const stepX = dx * invDistance * step;
+  const stepY = dy * invDistance * step;
+  const stepZ = dz * invDistance * step;
+  plane.x += stepX;
+  plane.y += stepY;
+  plane.z += stepZ;
+  plane.velocityX = dt > 0 ? stepX / dt : 0;
+  plane.velocityY = dt > 0 ? stepY / dt : 0;
+  plane.velocityZ = dt > 0 ? stepZ / dt : 0;
+  plane.yaw = fixedYaw ?? Math.atan2(dx, dz);
+  return false;
+}
+
+function sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth) {
+  const x = AIRPORT_CENTER.x + plane.runwayOffsetX;
+  let z = thresholdNorth;
+  let altitude = 0;
+
+  if (cycle < 0.28) {
+    const t = cycle / 0.28;
+    z = lerp(thresholdNorth - plane.approachDistance, thresholdNorth, t);
+    altitude = lerp(plane.cruiseAltitude, 1.6, smoothstep(t));
+  } else if (cycle < 0.46) {
+    const t = (cycle - 0.28) / 0.18;
+    z = lerp(thresholdNorth, thresholdSouth - 16, t);
+    altitude = 1.6;
+  } else if (cycle < 0.56) {
+    const t = (cycle - 0.46) / 0.1;
+    z = lerp(thresholdSouth - 16, thresholdSouth, t);
+    altitude = lerp(1.6, 2.4, t);
+  } else if (cycle < 0.78) {
+    const t = (cycle - 0.56) / 0.22;
+    z = lerp(thresholdSouth, thresholdSouth + plane.departureDistance, t);
+    altitude = lerp(2.4, plane.cruiseAltitude, smoothstep(t));
+  } else {
+    const t = (cycle - 0.78) / 0.22;
+    z = lerp(thresholdSouth + plane.departureDistance, thresholdNorth - plane.approachDistance, t);
+    altitude = lerp(plane.cruiseAltitude, plane.cruiseAltitude - 2, t);
+  }
+
+  return { x, y: altitude, z };
+}
+
+function smoothstep(t) {
+  return t * t * (3 - 2 * t);
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
 }
 
 function updateBusMotion(dtSeconds) {

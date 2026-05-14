@@ -14,6 +14,7 @@ export class PlayerState {
     inPlane,
     inCar,
     vehicleMode,
+    aiPlaneId,
     planeSpeed,
     carSpeed,
     planeBraking,
@@ -34,6 +35,7 @@ export class PlayerState {
     this.inPlane = inPlane;
     this.inCar = inCar;
     this.vehicleMode = vehicleMode ?? null;
+    this.aiPlaneId = typeof aiPlaneId === "string" ? aiPlaneId : null;
     this.planeSpeed = planeSpeed;
     this.carSpeed = carSpeed;
     this.planeBraking = !!planeBraking;
@@ -60,6 +62,7 @@ export class PlayerState {
       inPlane: false,
       inCar: false,
       vehicleMode: null,
+      aiPlaneId: null,
       planeSpeed: 0,
       carSpeed: 0,
       planeBraking: false,
@@ -353,6 +356,7 @@ export class PlayerState {
     if (this.inPlane) {
       this.inPlane = false;
       this.vehicleMode = null;
+      this.aiPlaneId = null;
       this.planeSpeed = 0;
       this.position.y = Math.max(config.groundY, config.planeMinAltitude - 1.2);
       this.velocity.x = 0;
@@ -368,6 +372,8 @@ export class PlayerState {
 
     this.inPlane = true;
     this.inCar = false;
+    this.vehicleMode = null;
+    this.aiPlaneId = null;
     this.position.x = parkedPlane.x;
     this.position.z = parkedPlane.z;
     this.position.y = config.planeMinAltitude + 0.6;
@@ -387,6 +393,7 @@ export class PlayerState {
       const exitSideZ = Math.sin(exitYaw) * exitOffset;
       this.inCar = false;
       this.vehicleMode = null;
+      this.aiPlaneId = null;
       this.carSpeed = 0;
       if (config.parkedCar) {
         config.parkedCar.x = this.position.x;
@@ -415,6 +422,7 @@ export class PlayerState {
     this.inPlane = false;
     this.inCar = true;
     this.vehicleMode = "car";
+    this.aiPlaneId = null;
     this.position.x = parkedCar.x;
     this.position.z = parkedCar.z;
     this.position.y = config.groundY;
@@ -465,6 +473,7 @@ export class PlayerState {
 
       this.inCar = false;
       this.vehicleMode = null;
+      this.aiPlaneId = null;
       this.carSpeed = 0;
       this.position.x += exitSideX;
       this.position.z += exitSideZ;
@@ -494,6 +503,7 @@ export class PlayerState {
     this.inPlane = false;
     this.inCar = true;
     this.vehicleMode = "bus";
+    this.aiPlaneId = null;
     this.position.x = Number.isFinite(bus.x) ? bus.x : this.position.x;
     this.position.z = Number.isFinite(bus.z) ? bus.z : this.position.z;
     this.position.y = config.groundY;
@@ -539,6 +549,8 @@ export class PlayerState {
     };
     this.inPlane = false;
     this.inCar = false;
+    this.vehicleMode = null;
+    this.aiPlaneId = null;
     this.planeSpeed = 0;
     this.carSpeed = 0;
     this.position.y = 0;
@@ -569,6 +581,7 @@ export class PlayerState {
       inPlane: this.inPlane,
       inCar: this.inCar,
       vehicleMode: this.vehicleMode,
+      aiPlaneId: this.aiPlaneId,
       avatar: this.avatar,
     };
   }
@@ -668,7 +681,6 @@ function getNearestVehicle(position, config) {
   if (config.parkedPlane) {
     candidates.push({ type: "plane", ...config.parkedPlane });
   }
-
   let nearestVehicle = null;
   for (const vehicle of candidates) {
     const radius = Number.isFinite(vehicle.boardingRadius) ? vehicle.boardingRadius : 12;

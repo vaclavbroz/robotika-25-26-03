@@ -2,6 +2,8 @@ import * as THREE from "three";
 
 const WORLD_SIZE = 500;
 const TERRAIN_SEGMENTS = 220;
+const TERRAIN_HALF_SIZE = WORLD_SIZE * 0.5;
+const TERRAIN_GRID_STEP = WORLD_SIZE / TERRAIN_SEGMENTS;
 const PLAYER_HEIGHT = 1.55;
 const RC_PLANE_MIN_ALTITUDE = 1.2;
 const RC_PLANE_MAX_ALTITUDE = 28;
@@ -10,6 +12,11 @@ const RC_PLANE_MAX_SPEED = 26;
 const AVATAR_BALL_RADIUS = 0.75;
 const AVATAR_LABEL_Y = 1.15;
 const GROUND_CONTACT_VISUAL_BIAS = 0.03;
+const TERRAIN_CONTACT_SAMPLE_RINGS = [
+  { scale: 0.5, samples: 8 },
+  { scale: 0.95, samples: 12 },
+];
+let terrainHeightSampler = null;
 const LABEL_PIXELS_TO_WORLD_X = 1.9 / 384;
 const LABEL_PIXELS_TO_WORLD_Y = 0.48 / 96;
 const AVATAR_PATTERNS = new Set(["stripes", "checker"]);
@@ -82,9 +89,39 @@ const BUS_BODY_COLOR = 0x205f9d;
 const BUS_ACCENT_COLOR = 0xffe58b;
 const BUS_WINDOW_COLOR = 0x8db4cc;
 const FOREST_CENTER = { x: 102, z: 118 };
+const FOREST_ANIMAL_ZONES = [
+  { x: FOREST_CENTER.x, z: FOREST_CENTER.z, radius: 42 },
+  { x: CITY_CENTER.x - 34, z: CITY_CENTER.z + 72, radius: 28 },
+  { x: RAILWAY_STATION_X + 36, z: RAILWAY_Z + 10, radius: 28 },
+  { x: -30, z: 148, radius: 24 },
+  { x: AIRPORT_CENTER.x - 52, z: AIRPORT_CENTER.z + 66, radius: 22 },
+  { x: 150, z: 60, radius: 20 },
+];
+const FOREST_ANIMAL_DEFINITIONS = [
+  { type: "bear", count: 2, speed: { min: 1.0, max: 1.7 }, size: 1.2 },
+  { type: "fox", count: 3, speed: { min: 1.4, max: 2.2 }, size: 0.95 },
+  { type: "rabbit", count: 4, speed: { min: 1.8, max: 2.8 }, size: 0.75 },
+];
+const FOREST_ANIMAL_VISUALS = {
+  bear: { color: 0x5e4630, body: { w: 1.55, h: 0.75, d: 1.35 }, head: 0.29, legHeight: 0.58, legRadius: 0.13, bob: 0.06, stride: 0.85 },
+  fox: { color: 0xe08a44, body: { w: 1.22, h: 0.62, d: 1.18 }, head: 0.22, legHeight: 0.46, legRadius: 0.1, bob: 0.05, stride: 0.72 },
+  rabbit: { color: 0xece7d8, body: { w: 0.84, h: 0.42, d: 0.94 }, head: 0.16, legHeight: 0.34, legRadius: 0.065, bob: 0.04, stride: 0.95 },
+};
+const FLYING_BIRDS_COUNT = 10;
+const FLYING_BIRD_SPEED = { min: 11, max: 18 };
+const FLYING_BIRD_SIZE = { min: 0.55, max: 1.0 };
+const FLYING_BIRD_ALTITUDE = { min: 20, max: 90 };
+const FLYING_BIRD_RETARGET_SECONDS = { min: 2.4, max: 5.7 };
+const FLYING_BIRD_LANDING_CHANCE = 0.35;
+const FLYING_BIRD_PERCH_SECONDS = { min: 2, max: 5 };
+const AIRPORT_AI_PARK_HOLD_SECONDS = 30;
+const AIRPORT_AI_TAXI_TO_PARK_SPEED = 10;
+const AIRPORT_AI_TAXI_TO_RUNWAY_SPEED = 11;
+const AIRPORT_AI_TAKEOFF_AIRBORNE_ALTITUDE = 4.5;
 const PARKED_PLANE_POSITION = { x: 122, z: -88 };
 const PARKED_CAR_POSITION = { x: 8, z: 6 };
 const PARKED_CAR_YAW = Math.PI * 0.35;
+const AIRPORT_AI_DEPARTURE_CYCLE_START = 0.56;
 const DAY_DURATION_SECONDS = 5 * 60;
 const NIGHT_DURATION_SECONDS = 3 * 60;
 const DAY_NIGHT_CYCLE_SECONDS = DAY_DURATION_SECONDS + NIGHT_DURATION_SECONDS;
@@ -155,6 +192,7 @@ for (let i = 0; i < terrainPosition.count; i += 1) {
   terrainPosition.setY(i, terrainHeight(x, z));
 }
 terrainGeometry.computeVertexNormals();
+terrainHeightSampler = createTerrainHeightSampler(terrainPosition);
 const terrainDetailTexture = createTerrainDetailTexture(renderer);
 const touchdownSmokeTexture = createTouchdownSmokeTexture();
 
@@ -234,6 +272,7 @@ const net = {
   playerPlanesById: new Map(),
   playerCarsById: new Map(),
   planeTouchdownStateById: new Map(),
+  airportTrafficById: new Map(),
   lastAiPlaneCollisionAt: -Infinity,
   latestServerTick: 0,
   lastStateAtMs: 0,
@@ -250,7 +289,16 @@ const lookDirection = new THREE.Vector3();
 const rollDelta = new THREE.Vector3();
 const rollAxis = new THREE.Vector3();
 const rollQuat = new THREE.Quaternion();
+const planeCameraBehindOffset = new THREE.Vector3(-16, 5.2, 0);
+const planeCameraLookOffset = new THREE.Vector3(20, 1.8, 0);
+const carCameraBehindOffset = new THREE.Vector3(0, 4.2, -10);
+const carCameraLookOffset = new THREE.Vector3(0, 1.6, 10);
+const cameraOffset = new THREE.Vector3();
+const cameraLookOffset = new THREE.Vector3();
+const localInterpolationSample = { x: 0, y: 0, z: 0 };
+const remoteInterpolationSample = { x: 0, y: 0, z: 0 };
 const airportTraffic = [];
+let airportDepartureInProgress = null;
 const runwayLights = [];
 const runwayLightSources = [];
 const runwayLightGlows = [];
@@ -258,11 +306,64 @@ const runwayApproachLights = [];
 const runwayApproachLightSources = [];
 const runwayApproachLightGlows = [];
 const runwayApproachSpotlights = [];
+const flyingBirds = [];
+const forestAnimals = [];
 const railwayTraffic = [];
 const activeExplosions = [];
 const activeBurningWrecks = [];
 const activeTouchdownSmokes = [];
 const activeAircraftLights = [];
+
+function buildAirportParkStands(count) {
+  const needed = Math.max(0, Math.floor(count));
+  const stands = [];
+  if (needed === 0) {
+    return stands;
+  }
+
+  const runwayLeftX = AIRPORT_CENTER.x - AIRPORT_RUNWAY_WIDTH * 0.5 - 8;
+  const standStartZ = AIRPORT_CENTER.z + AIRPORT_RUNWAY_LENGTH * 0.5 - 14;
+  const standSpacingZ = 16;
+  const terminalBounds = {
+    xMin: AIRPORT_CENTER.x - 42 - 1,
+    xMax: AIRPORT_CENTER.x - 42 + 26 + 1,
+    zMin: AIRPORT_CENTER.z + 12 - 7,
+    zMax: AIRPORT_CENTER.z + 12 + 7,
+  };
+
+  for (let i = 0; i < needed; i += 1) {
+    const x = runwayLeftX;
+    let z = standStartZ - i * standSpacingZ;
+    let attempts = 0;
+    while (
+      x >= terminalBounds.xMin
+      && x <= terminalBounds.xMax
+      && z >= terminalBounds.zMin
+      && z <= terminalBounds.zMax
+      && attempts < 30
+    ) {
+      z -= standSpacingZ;
+      attempts += 1;
+    }
+
+    let isInForest = false;
+    for (const zone of FOREST_ANIMAL_ZONES) {
+      const dx = x - zone.x;
+      const dz = z - zone.z;
+      if (dx * dx + dz * dz <= Math.pow(zone.radius + 10, 2)) {
+        isInForest = true;
+        break;
+      }
+    }
+    if (isInForest) {
+      z -= 3 * standSpacingZ;
+    }
+    stands.push({ x, z });
+  }
+
+  return stands;
+}
+
 const parkedPlaneState = {
   mesh: null,
 };
@@ -304,6 +405,7 @@ createModelAirfield();
 createBus();
 createCity();
 createForest();
+createFlyingBirds();
 let dragLookActive = false;
 let hasEverCapturedPointer = false;
 
@@ -479,19 +581,22 @@ function animate() {
   requestAnimationFrame(animate);
 
   const dt = Math.min(clock.getDelta(), 0.05);
+  const elapsedTime = clock.elapsedTime;
   sendInputTicks(dt);
   syncLocalPlayerFromServer();
   syncRenderedPlayersFromServer();
   updateNetDebug();
-  updateAirportTraffic(clock.elapsedTime);
-  updateRailwayTraffic(clock.elapsedTime);
+  updateAirportTraffic(elapsedTime, dt);
+  updateRailwayTraffic(elapsedTime);
   updateBusTraffic(dt);
+  updateForestAnimals(dt);
+  updateFlyingBirds(dt);
   updateExplosions(dt);
   updateBurningWrecks(dt);
   updateTouchdownSmokes(dt);
-  updateWeatherSystem(clock.elapsedTime, dt);
-  updateDayNightCycle(clock.elapsedTime);
-  updateAircraftBeacons(clock.elapsedTime);
+  updateWeatherSystem(elapsedTime, dt);
+  updateDayNightCycle(elapsedTime);
+  updateAircraftBeacons(elapsedTime);
 
   lookDirection.set(
     Math.sin(player.courseYaw) * Math.cos(player.pitch),
@@ -519,20 +624,16 @@ function animate() {
     cameraTarget.y += 0.6;
     camera.lookAt(cameraTarget);
   } else if (localState?.inPlane && localPlane) {
-    const behindOffset = new THREE.Vector3(-16, 5.2, 0);
-    const lookOffset = new THREE.Vector3(20, 1.8, 0);
-    behindOffset.applyQuaternion(localPlane.quaternion);
-    lookOffset.applyQuaternion(localPlane.quaternion);
-    camera.position.copy(localPlane.position).add(behindOffset);
-    cameraTarget.copy(localPlane.position).add(lookOffset);
+    cameraOffset.copy(planeCameraBehindOffset).applyQuaternion(localPlane.quaternion);
+    cameraLookOffset.copy(planeCameraLookOffset).applyQuaternion(localPlane.quaternion);
+    camera.position.copy(localPlane.position).add(cameraOffset);
+    cameraTarget.copy(localPlane.position).add(cameraLookOffset);
     camera.lookAt(cameraTarget);
   } else if (localState?.inCar && localCar) {
-    const behindOffset = new THREE.Vector3(0, 4.2, -10);
-    const lookOffset = new THREE.Vector3(0, 1.6, 10);
-    behindOffset.applyQuaternion(localCar.quaternion);
-    lookOffset.applyQuaternion(localCar.quaternion);
-    camera.position.copy(localCar.position).add(behindOffset);
-    cameraTarget.copy(localCar.position).add(lookOffset);
+    cameraOffset.copy(carCameraBehindOffset).applyQuaternion(localCar.quaternion);
+    cameraLookOffset.copy(carCameraLookOffset).applyQuaternion(localCar.quaternion);
+    camera.position.copy(localCar.position).add(cameraOffset);
+    cameraTarget.copy(localCar.position).add(cameraLookOffset);
     camera.lookAt(cameraTarget);
   } else {
     camera.position.copy(player.position);
@@ -636,6 +737,7 @@ function onServerMessage(message) {
     }
     net.playersById.clear();
     net.samplesByPlayerId.clear();
+    net.airportTrafficById.clear();
     for (const playerId of net.playerAvatarsById.keys()) {
       removePlayerAvatar(playerId);
     }
@@ -646,6 +748,7 @@ function onServerMessage(message) {
       removePlayerCar(playerId);
     }
 
+    syncAirportTrafficState(message.snapshot?.airportTraffic);
     syncParkedCarState(message.snapshot?.parkedCar);
     const snapshotPlayers = Array.isArray(message.snapshot?.players) ? message.snapshot.players : [];
     applyServerPlayerStates(snapshotPlayers, message.snapshot?.tick, { replaceAll: true });
@@ -669,6 +772,7 @@ function onServerMessage(message) {
   }
 
   if (message.type === "snapshot") {
+    syncAirportTrafficState(message.airportTraffic);
     syncParkedCarState(message.parkedCar);
     const nextPlayers = Array.isArray(message.players) ? message.players : [];
     applyServerPlayerStates(nextPlayers, message.tick, { replaceAll: true });
@@ -676,6 +780,7 @@ function onServerMessage(message) {
   }
 
   if (message.type === "delta") {
+    syncAirportTrafficState(message.airportTraffic);
     syncParkedCarState(message.parkedCar);
     const nextPlayers = Array.isArray(message.players) ? message.players : [];
     applyServerPlayerStates(nextPlayers, message.tick);
@@ -824,7 +929,7 @@ function syncLocalPlayerFromServer() {
     return;
   }
   const authoritative = net.playersById.get(net.playerId);
-  const sample = sampleInterpolatedPosition(net.playerId);
+  const sample = sampleInterpolatedPosition(net.playerId, localInterpolationSample);
   if (!sample && !authoritative?.position) {
     if (DEBUG_NET && net.connected) {
       const now = performance.now();
@@ -911,7 +1016,7 @@ function syncRenderedPlayersFromServer() {
 
     removePlayerPlane(playerId);
     removePlayerCar(playerId);
-    const sample = sampleInterpolatedPosition(playerId);
+    const sample = sampleInterpolatedPosition(playerId, remoteInterpolationSample);
     const position = sample ?? state?.position;
     if (!position) {
       continue;
@@ -1998,7 +2103,7 @@ function removePlayerAvatar(playerId) {
   net.playerAvatarsById.delete(playerId);
 }
 
-function sampleInterpolatedPosition(playerId) {
+function sampleInterpolatedPosition(playerId, out = null) {
   const samples = net.samplesByPlayerId.get(playerId);
   if (!samples || samples.length < 2) {
     return null;
@@ -2022,6 +2127,12 @@ function sampleInterpolatedPosition(playerId) {
     const previous = samples[i - 1];
     const spanMs = Math.max(1, current.atMs - previous.atMs);
     const alpha = THREE.MathUtils.clamp((renderAtMs - previous.atMs) / spanMs, 0, 1);
+    if (out) {
+      out.x = THREE.MathUtils.lerp(previous.x, current.x, alpha);
+      out.y = THREE.MathUtils.lerp(previous.y, current.y, alpha);
+      out.z = THREE.MathUtils.lerp(previous.z, current.z, alpha);
+      return out;
+    }
     return {
       x: THREE.MathUtils.lerp(previous.x, current.x, alpha),
       y: THREE.MathUtils.lerp(previous.y, current.y, alpha),
@@ -2253,6 +2364,10 @@ window.addEventListener("resize", () => {
 });
 
 function terrainHeight(x, z) {
+  if (terrainHeightSampler) {
+    return sampleTerrainHeightFromMesh(x, z);
+  }
+
   const airportOverride = airportTerrainOverride(x, z);
   if (airportOverride !== null) {
     return airportOverride;
@@ -2273,6 +2388,31 @@ function terrainHeight(x, z) {
   const ripples = fbm(x * 0.085, z * 0.085, 2, 2.0, 0.5) * 0.9;
 
   return mountains + hills + ripples;
+}
+
+function sampleTerrainHeightFromMesh(x, z) {
+  const clampedX = THREE.MathUtils.clamp(x, -TERRAIN_HALF_SIZE, TERRAIN_HALF_SIZE);
+  const clampedZ = THREE.MathUtils.clamp(z, -TERRAIN_HALF_SIZE, TERRAIN_HALF_SIZE);
+  const normalizedX = (clampedX + TERRAIN_HALF_SIZE) / TERRAIN_GRID_STEP;
+  const normalizedZ = (clampedZ + TERRAIN_HALF_SIZE) / TERRAIN_GRID_STEP;
+  const maxCellIndex = TERRAIN_SEGMENTS - 1;
+  const cellX = Math.min(Math.floor(normalizedX), maxCellIndex);
+  const cellZ = Math.min(Math.floor(normalizedZ), maxCellIndex);
+  const tx = normalizedX - cellX;
+  const tz = normalizedZ - cellZ;
+  const rowStride = terrainHeightSampler.gridSize;
+  const topLeftIndex = (cellZ * rowStride) + cellX;
+  const topRightIndex = topLeftIndex + 1;
+  const bottomLeftIndex = topLeftIndex + rowStride;
+  const bottomRightIndex = bottomLeftIndex + 1;
+  const heights = terrainHeightSampler.heights;
+  const h00 = heights[topLeftIndex];
+  const h10 = heights[topRightIndex];
+  const h01 = heights[bottomLeftIndex];
+  const h11 = heights[bottomRightIndex];
+  const top = THREE.MathUtils.lerp(h00, h10, tx);
+  const bottom = THREE.MathUtils.lerp(h01, h11, tx);
+  return THREE.MathUtils.lerp(top, bottom, tz);
 }
 
 function airportTerrainOverride(x, z) {
@@ -2483,29 +2623,7 @@ function createAirport() {
   apron.receiveShadow = true;
   airport.add(apron);
 
-  const taxiway = new THREE.Mesh(
-    new THREE.BoxGeometry(16, 0.08, 34),
-    new THREE.MeshStandardMaterial({
-      color: 0x626a6e,
-      roughness: 0.88,
-      metalness: 0.03,
-    }),
-  );
-  taxiway.position.set(AIRPORT_CENTER.x - 8, runwayY + 0.01, AIRPORT_CENTER.z + 14);
-  taxiway.receiveShadow = true;
-  airport.add(taxiway);
-
-  for (const standOffset of [-10, 10]) {
-    const standMark = new THREE.Mesh(
-      new THREE.RingGeometry(3.4, 3.9, 24),
-      stripeMaterial,
-    );
-    standMark.rotation.x = -Math.PI / 2;
-    standMark.position.set(apronCenter.x - 7, runwayY + 0.13, apronCenter.z + standOffset);
-    airport.add(standMark);
-  }
-
-  for (const planeConfig of [
+  const planeConfigs = [
     {
       runwayOffsetX: -3.2,
       cycleDuration: 40,
@@ -2556,12 +2674,62 @@ function createAirport() {
       body: 0xe8edf5,
       accent: 0x7559b7,
     },
-  ]) {
+  ];
+  const airportParkStands = buildAirportParkStands(planeConfigs.length);
+
+  const taxiway = new THREE.Mesh(
+    new THREE.BoxGeometry(16, 0.08, 34),
+    new THREE.MeshStandardMaterial({
+      color: 0x626a6e,
+      roughness: 0.88,
+      metalness: 0.03,
+    }),
+  );
+  taxiway.position.set(AIRPORT_CENTER.x - 8, runwayY + 0.01, AIRPORT_CENTER.z + 14);
+  taxiway.receiveShadow = true;
+  airport.add(taxiway);
+
+  const standPadMaterial = new THREE.MeshStandardMaterial({
+    color: 0x666f7d,
+    roughness: 0.9,
+    metalness: 0.02,
+  });
+  for (const stand of airportParkStands) {
+    const standPad = new THREE.Mesh(new THREE.BoxGeometry(6.8, 0.06, 7.8), standPadMaterial);
+    standPad.position.set(stand.x, runwayY - 0.01, stand.z);
+    standPad.receiveShadow = true;
+    airport.add(standPad);
+
+    const standMark = new THREE.Mesh(
+      new THREE.RingGeometry(3.4, 3.9, 24),
+      stripeMaterial,
+    );
+    standMark.rotation.x = -Math.PI / 2;
+    standMark.position.set(stand.x, runwayY + 0.13, stand.z);
+    airport.add(standMark);
+  }
+  for (let i = 0; i < planeConfigs.length; i += 1) {
+    const planeConfig = planeConfigs[i];
+    const parking = airportParkStands[i];
     const airliner = createAirliner(planeConfig);
     airport.add(airliner);
     airportTraffic.push({
+      id: `airliner-${i}`,
       mesh: airliner,
+      state: "approach",
+      parkingX: parking.x,
+      parkingY: runwayY + 0.1,
+      parkingZ: parking.z,
+      parkingYaw: -Math.PI / 2,
+      departureAirborneReleased: false,
+      holdRemaining: 0,
+      parkHoldSeconds: AIRPORT_AI_PARK_HOLD_SECONDS,
+      taxiToParkSpeed: AIRPORT_AI_TAXI_TO_PARK_SPEED,
+      taxiToRunwaySpeed: AIRPORT_AI_TAXI_TO_RUNWAY_SPEED,
+      takeoffStartTime: 0,
       runwayOffsetX: planeConfig.runwayOffsetX,
+      runwayAlignedX: AIRPORT_CENTER.x + planeConfig.runwayOffsetX,
+      runwayTurnState: "idle",
       cycleDuration: planeConfig.cycleDuration,
       phase: planeConfig.phase,
       cruiseAltitude: planeConfig.cruiseAltitude,
@@ -3433,6 +3601,20 @@ function syncParkedCarState(nextParkedCar) {
   applyParkedCarTransform();
 }
 
+function syncAirportTrafficState(nextTraffic) {
+  if (!Array.isArray(nextTraffic)) {
+    return;
+  }
+
+  net.airportTrafficById.clear();
+  for (const planeState of nextTraffic) {
+    if (!planeState || typeof planeState.id !== "string") {
+      continue;
+    }
+    net.airportTrafficById.set(planeState.id, planeState);
+  }
+}
+
 function applyParkedCarTransform() {
   if (!parkedCarState.mesh) {
     return;
@@ -3762,7 +3944,310 @@ function createForest() {
   addCluster(AIRPORT_CENTER.x - 52, AIRPORT_CENTER.z + 66, 10, 10, 6.5, 6.8, 17);
   addCluster(150, 60, 8, 7, 7.1, 7.4, 21);
 
+  createForestAnimals();
   scene.add(forest);
+}
+
+function pickForestAnimalTarget(animal) {
+  for (let i = 0; i < 25; i += 1) {
+    const zone = FOREST_ANIMAL_ZONES[Math.floor(Math.random() * FOREST_ANIMAL_ZONES.length)] || FOREST_ANIMAL_ZONES[0];
+    const angle = Math.random() * Math.PI * 2;
+    const spread = zone.radius * Math.sqrt(Math.random());
+    const candidateX = zone.x + Math.cos(angle) * spread;
+    const candidateZ = zone.z + Math.sin(angle) * spread;
+    const worldLimit = WORLD_SIZE * 0.5 - 12;
+
+    if (
+      candidateX >= -worldLimit &&
+      candidateX <= worldLimit &&
+      candidateZ >= -worldLimit &&
+      candidateZ <= worldLimit
+    ) {
+      animal.targetX = candidateX;
+      animal.targetZ = candidateZ;
+      animal.phase = Math.random() * Math.PI * 2;
+      return;
+    }
+  }
+
+  const firstZone = FOREST_ANIMAL_ZONES[0];
+  animal.targetX = firstZone.x;
+  animal.targetZ = firstZone.z;
+  animal.phase = 0;
+}
+
+function createForestAnimalMesh(type) {
+  const spec = FOREST_ANIMAL_VISUALS[type] || FOREST_ANIMAL_VISUALS.bear;
+  const material = new THREE.MeshStandardMaterial({
+    color: spec.color,
+    roughness: 0.84,
+    metalness: 0.02,
+  });
+
+  const animal = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(spec.body.w, spec.body.h, spec.body.d),
+    material,
+  );
+  body.position.set(0, spec.legHeight + spec.body.h * 0.5, 0);
+  body.castShadow = true;
+  animal.add(body);
+
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(spec.head, 12, 10),
+    material,
+  );
+  head.position.set(0, spec.legHeight + spec.body.h * 0.75, spec.body.d * 0.45);
+  head.castShadow = true;
+  animal.add(head);
+
+  if (type === "fox") {
+    const snout = new THREE.Mesh(
+      new THREE.CapsuleGeometry(spec.head * 0.25, spec.head * 0.85, 8, 8),
+      material,
+    );
+    snout.position.set(0, spec.legHeight + spec.body.h * 0.58, spec.body.d * 0.66);
+    animal.add(snout);
+
+    const tail = new THREE.Mesh(
+      new THREE.CylinderGeometry(spec.head * 0.2, spec.head * 0.4, 0.68, 8),
+      material,
+    );
+    tail.position.set(-spec.body.w * 0.32, spec.legHeight + 0.22, -spec.body.d * 0.55);
+    tail.rotation.z = Math.PI / 3;
+    tail.castShadow = true;
+    animal.add(tail);
+  } else if (type === "bear") {
+    const ears = new THREE.Mesh(
+      new THREE.SphereGeometry(spec.head * 0.2, 10, 8),
+      material,
+    );
+    ears.position.set(0, spec.legHeight + spec.body.h + 0.16, spec.body.d * 0.46);
+    ears.scale.set(1, 0.7, 1);
+    animal.add(ears);
+  } else {
+    const earLeft = new THREE.Mesh(new THREE.ConeGeometry(spec.head * 0.2, spec.head * 0.35, 6), material);
+    earLeft.position.set(-spec.head * 0.2, spec.legHeight + spec.body.h + 0.16, spec.body.d * 0.4);
+    earLeft.rotation.x = -Math.PI / 3;
+    earLeft.castShadow = true;
+    animal.add(earLeft);
+
+    const earRight = earLeft.clone();
+    earRight.position.x = spec.head * 0.2;
+    earRight.rotation.x = -Math.PI / 3;
+    animal.add(earRight);
+  }
+
+  const legOffsets = [
+    [spec.body.w * 0.3, spec.body.d * 0.28],
+    [spec.body.w * 0.3, -spec.body.d * 0.28],
+    [-(spec.body.w * 0.3), spec.body.d * 0.28],
+    [-(spec.body.w * 0.3), -spec.body.d * 0.28],
+  ];
+  const legs = [];
+  for (let i = 0; i < legOffsets.length; i += 1) {
+    const offset = legOffsets[i];
+    const leg = new THREE.Mesh(
+      new THREE.CylinderGeometry(spec.legRadius, spec.legRadius, spec.legHeight, 8),
+      material,
+    );
+    leg.position.set(offset[0], spec.legHeight * 0.5, offset[1]);
+    leg.castShadow = true;
+    animal.add(leg);
+    legs.push({
+      mesh: leg,
+      phase: i * (Math.PI / 2),
+    });
+  }
+
+  return { animal, legs, baseY: spec.legHeight + spec.body.h * 0.5, spec };
+}
+
+function createForestAnimal(config) {
+  const spec = config?.type ? FOREST_ANIMAL_VISUALS[config.type] : null;
+  if (!spec) {
+    return;
+  }
+
+  const created = createForestAnimalMesh(config.type);
+  const animal = created.animal;
+  const scale = config.size ?? 1;
+  animal.scale.setScalar(scale);
+
+  const speed = config.speed || 1.1;
+  const startZone = FOREST_ANIMAL_ZONES[Math.floor(Math.random() * FOREST_ANIMAL_ZONES.length)] || FOREST_ANIMAL_ZONES[0];
+  const startAngle = Math.random() * Math.PI * 2;
+  const startRadius = startZone.radius * 0.2 + Math.random() * startZone.radius * 0.35;
+  const worldLimit = WORLD_SIZE * 0.5 - 12;
+  const x = THREE.MathUtils.clamp(startZone.x + Math.cos(startAngle) * startRadius, -worldLimit, worldLimit);
+  const z = THREE.MathUtils.clamp(startZone.z + Math.sin(startAngle) * startRadius, -worldLimit, worldLimit);
+
+  const state = {
+    mesh: animal,
+    type: config.type,
+    speed,
+    runPhase: Math.random() * Math.PI * 2,
+    targetX: x,
+    targetZ: z,
+    homeX: x,
+    homeZ: z,
+    homeRadius: startZone.radius * 0.85,
+    baseY: created.baseY * scale,
+    legs: created.legs,
+    stride: spec.stride,
+    bob: spec.bob,
+  };
+
+  scene.add(animal);
+  forestAnimals.push(state);
+  pickForestAnimalTarget(state);
+  state.mesh.position.set(x, terrainHeight(x, z) + state.baseY + Math.max(0.02, state.bob * 0.5), z);
+}
+
+function createForestAnimals() {
+  for (const definition of FOREST_ANIMAL_DEFINITIONS) {
+    for (let i = 0; i < definition.count; i += 1) {
+      createForestAnimal({
+        type: definition.type,
+        size: definition.size,
+        speed: THREE.MathUtils.lerp(
+          definition.speed.min,
+          definition.speed.max,
+          Math.random(),
+        ),
+      });
+    }
+  }
+}
+
+function pickBirdTarget(bird) {
+  const shouldLand = Math.random() < FLYING_BIRD_LANDING_CHANCE;
+  if (shouldLand) {
+    const zone = FOREST_ANIMAL_ZONES[Math.floor(Math.random() * FOREST_ANIMAL_ZONES.length)] || FOREST_ANIMAL_ZONES[0];
+    const angle = Math.random() * Math.PI * 2;
+    const spread = zone.radius * Math.sqrt(Math.random());
+    const targetX = zone.x + Math.cos(angle) * spread;
+    const targetZ = zone.z + Math.sin(angle) * spread;
+    const worldLimit = WORLD_SIZE * 0.5 - 12;
+
+    bird.targetX = THREE.MathUtils.clamp(targetX, -worldLimit, worldLimit);
+    bird.targetZ = THREE.MathUtils.clamp(targetZ, -worldLimit, worldLimit);
+    bird.targetY = terrainHeight(bird.targetX, bird.targetZ) + 0.2;
+    bird.retargetInSeconds = THREE.MathUtils.lerp(
+      FLYING_BIRD_PERCH_SECONDS.min,
+      FLYING_BIRD_PERCH_SECONDS.max,
+      Math.random(),
+    );
+    bird.isLanding = true;
+    bird.isPerched = false;
+    bird.preferredMode = "land";
+    return;
+  }
+
+  const worldLimit = WORLD_SIZE * 0.5 - 20;
+  const worldWidth = worldLimit * 2;
+  const offset = (Math.random() - 0.5) * worldWidth;
+  const useEdgeStart = Math.random() < 0.45;
+  const startAtNorthSouth = Math.random() < 0.5;
+  let targetX = 0;
+  let targetZ = 0;
+
+  if (useEdgeStart) {
+    if (startAtNorthSouth) {
+      targetX = (Math.random() * worldWidth) - worldLimit;
+      targetZ = Math.random() < 0.5 ? worldLimit : -worldLimit;
+    } else {
+      targetX = Math.random() < 0.5 ? worldLimit : -worldLimit;
+      targetZ = (Math.random() * worldWidth) - worldLimit;
+    }
+  } else {
+    targetX = (Math.random() * worldWidth) - worldLimit;
+    targetZ = (Math.random() * worldWidth) - worldLimit;
+  }
+
+  bird.targetX = targetX;
+  bird.targetZ = targetZ;
+  bird.targetY = THREE.MathUtils.lerp(FLYING_BIRD_ALTITUDE.min, FLYING_BIRD_ALTITUDE.max, Math.random());
+  bird.retargetInSeconds = THREE.MathUtils.lerp(
+    FLYING_BIRD_RETARGET_SECONDS.min,
+    FLYING_BIRD_RETARGET_SECONDS.max,
+    Math.random(),
+  );
+  bird.isLanding = false;
+  bird.isPerched = false;
+  bird.preferredMode = "fly";
+}
+
+function createFlyingBird() {
+  const size = THREE.MathUtils.lerp(FLYING_BIRD_SIZE.min, FLYING_BIRD_SIZE.max, Math.random());
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xdce6ef,
+    roughness: 0.75,
+    metalness: 0.08,
+    side: THREE.DoubleSide,
+  });
+
+  const bird = new THREE.Group();
+
+  const body = new THREE.Mesh(
+    new THREE.SphereGeometry(size * 0.18, 10, 8),
+    material,
+  );
+  body.position.set(0, 0, size * 0.12);
+  bird.add(body);
+
+  const wingGeo = new THREE.BoxGeometry(size * 1.2, size * 0.02, size * 0.28);
+  const wingLeft = new THREE.Mesh(wingGeo, material);
+  const wingRight = wingLeft.clone();
+  wingLeft.position.set(-size * 0.18, 0, 0);
+  wingRight.position.set(size * 0.18, 0, 0);
+  wingLeft.rotation.z = Math.PI / 3;
+  wingRight.rotation.z = -Math.PI / 3;
+  bird.add(wingLeft);
+  bird.add(wingRight);
+
+  const tail = new THREE.Mesh(
+    new THREE.CapsuleGeometry(size * 0.09, size * 0.34, 4, 6),
+    material,
+  );
+  tail.position.set(0, 0, -size * 0.45);
+  tail.rotation.x = Math.PI / 2;
+  bird.add(tail);
+
+  const state = {
+    mesh: bird,
+    speed: THREE.MathUtils.lerp(FLYING_BIRD_SPEED.min, FLYING_BIRD_SPEED.max, Math.random()),
+    targetX: 0,
+    targetY: 25,
+    targetZ: 0,
+    flapPhase: Math.random() * Math.PI * 2,
+    retargetInSeconds: THREE.MathUtils.lerp(
+      FLYING_BIRD_RETARGET_SECONDS.min,
+      FLYING_BIRD_RETARGET_SECONDS.max,
+      Math.random(),
+    ),
+    wingLeft,
+    wingRight,
+    isLanding: false,
+    isPerched: false,
+  };
+
+  pickBirdTarget(state);
+  state.mesh.position.set(
+    (Math.random() * (WORLD_SIZE - 40)) - (WORLD_SIZE * 0.5 - 20),
+    THREE.MathUtils.lerp(FLYING_BIRD_ALTITUDE.min, FLYING_BIRD_ALTITUDE.max, Math.random()),
+    (Math.random() * (WORLD_SIZE - 40)) - (WORLD_SIZE * 0.5 - 20),
+  );
+  pickBirdTarget(state);
+  state.mesh.rotation.order = "YXZ";
+  scene.add(bird);
+  flyingBirds.push(state);
+}
+
+function createFlyingBirds() {
+  for (let i = 0; i < FLYING_BIRDS_COUNT; i += 1) {
+    createFlyingBird();
+  }
 }
 
 function createTrain() {
@@ -4555,21 +5040,154 @@ function setAircraftGearDeployed(airplane, deployed) {
   gearRoot.visible = deployed;
 }
 
-function updateAirportTraffic(elapsedTime) {
-  for (const plane of airportTraffic) {
+function updateAirportTraffic(elapsedTime, dt = 0.016) {
+  if (net.airportTrafficById.size > 0) {
+    for (const plane of airportTraffic) {
+      const state = net.airportTrafficById.get(plane.id);
+      if (!state) {
+        continue;
+      }
+      plane.state = state.state;
+      plane.mesh.visible = true;
+      plane.mesh.position.set(Number(state.x) || 0, Number(state.y) || 0, Number(state.z) || 0);
+      plane.mesh.rotation.set(0, Number.isFinite(state.yaw) ? state.yaw : 0, 0, "YXZ");
+      plane.mesh.rotateY(-Math.PI / 2);
+      plane.mesh.rotateZ(-(Number.isFinite(state.pitch) ? state.pitch : 0));
+      setAircraftGearDeployed(plane.mesh, state.onGround === true);
+    }
+    return;
+  }
+
+  const thresholdNorth = AIRPORT_CENTER.z - AIRPORT_RUNWAY_LENGTH * 0.5 + 8;
+  const thresholdSouth = AIRPORT_CENTER.z + AIRPORT_RUNWAY_LENGTH * 0.5 - 8;
+  const runwayBaseY = airportBaseTerrainHeight();
+  const delta = Math.max(0, dt);
+  const runwayEndZ = AIRPORT_CENTER.z + AIRPORT_RUNWAY_LENGTH * 0.5 - 1.2;
+  const runwayEndOffset = runwayEndZ - thresholdSouth;
+
+  for (let planeIndex = 0; planeIndex < airportTraffic.length; planeIndex += 1) {
+    const plane = airportTraffic[planeIndex];
     const hidden = plane.hiddenUntil && elapsedTime < plane.hiddenUntil;
     plane.mesh.visible = !hidden;
     if (hidden) {
       continue;
     }
 
-    const cycle = ((elapsedTime / plane.cycleDuration) + plane.phase) % 1;
-    const thresholdNorth = AIRPORT_CENTER.z - AIRPORT_RUNWAY_LENGTH * 0.5 + 8;
-    const thresholdSouth = AIRPORT_CENTER.z + AIRPORT_RUNWAY_LENGTH * 0.5 - 8;
+    if (plane.state === "taxiToPark") {
+      const taxiSpeed = plane.taxiToParkSpeed || AIRPORT_AI_TAXI_TO_PARK_SPEED;
+      const targetReached = moveAirportPlaneTowards(
+        plane,
+        plane.parkingX,
+        plane.parkingY,
+        plane.parkingZ,
+        taxiSpeed,
+        delta,
+      );
+
+      if (!targetReached) {
+        plane.mesh.rotation.set(0, plane.parkingYaw, 0, "YXZ");
+        setAircraftGearDeployed(plane.mesh, true);
+        continue;
+      }
+
+      plane.state = "holding";
+      plane.holdRemaining = plane.parkHoldSeconds ?? AIRPORT_AI_PARK_HOLD_SECONDS;
+      plane.mesh.position.set(plane.parkingX, plane.parkingY, plane.parkingZ);
+      plane.mesh.rotation.set(0, plane.parkingYaw, 0, "YXZ");
+      plane.wasOnRunway = false;
+      setAircraftGearDeployed(plane.mesh, true);
+      plane.runwayTurnState = "idle";
+      if (airportDepartureInProgress === plane) {
+        airportDepartureInProgress = null;
+      }
+      continue;
+    }
+
+    if (plane.state === "taxiToRunway") {
+      const taxiSpeed = plane.taxiToRunwaySpeed || AIRPORT_AI_TAXI_TO_RUNWAY_SPEED;
+      const runwayAlignedX = plane.runwayAlignedX ?? (AIRPORT_CENTER.x + plane.runwayOffsetX);
+      const isAligningRunway = plane.runwayTurnState !== "downRunway";
+      const targetX = runwayAlignedX;
+      const targetZ = isAligningRunway ? plane.parkingZ : runwayEndZ;
+      const targetY = runwayBaseY + 0.1;
+      const targetYaw = isAligningRunway
+        ? plane.parkingYaw + Math.PI / 2
+        : plane.parkingYaw;
+
+      const targetReached = moveAirportPlaneTowards(
+        plane,
+        targetX,
+        targetY,
+        targetZ,
+        taxiSpeed,
+        delta,
+        targetYaw,
+      );
+
+      if (!targetReached) {
+        plane.mesh.rotation.set(0, targetYaw, 0, "YXZ");
+        setAircraftGearDeployed(plane.mesh, true);
+        continue;
+      }
+
+      if (isAligningRunway) {
+        if (airportDepartureInProgress !== plane) {
+          plane.runwayTurnState = "runwayQueued";
+          const airportTurnStartYaw = isAligningRunway ? plane.parkingYaw + Math.PI / 2 : plane.parkingYaw;
+          plane.mesh.rotation.set(0, airportTurnStartYaw, 0, "YXZ");
+          continue;
+        }
+        plane.runwayTurnState = "downRunway";
+        continue;
+      }
+
+      plane.state = "departing";
+      plane.takeoffStartTime = elapsedTime;
+      plane.departureAirborneReleased = false;
+      plane.wasOnRunway = false;
+      plane.runwayTurnState = "idle";
+      setAircraftGearDeployed(plane.mesh, true);
+      continue;
+    }
+
+    if (plane.state === "holding") {
+      plane.holdRemaining -= delta;
+      plane.mesh.position.set(plane.parkingX, plane.parkingY, plane.parkingZ);
+      plane.mesh.rotation.set(0, plane.parkingYaw, 0, "YXZ");
+      setAircraftGearDeployed(plane.mesh, true);
+      if (plane.holdRemaining <= 0) {
+        if (!airportDepartureInProgress) {
+          plane.state = "taxiToRunway";
+          plane.takeoffStartTime = elapsedTime;
+          plane.runwayTurnState = "alignToRunway";
+          airportDepartureInProgress = plane;
+        }
+      }
+      continue;
+    }
+
+    if (plane.state === "departing" && elapsedTime >= plane.takeoffStartTime + plane.cycleDuration) {
+      if (airportDepartureInProgress === plane) {
+        airportDepartureInProgress = null;
+      }
+      plane.state = "approach";
+    }
+
+    const departureProgress = (elapsedTime - plane.takeoffStartTime) / plane.cycleDuration;
+    const cycle = plane.state === "departing"
+      ? AIRPORT_AI_DEPARTURE_CYCLE_START + Math.max(0, Math.min(1, departureProgress)) * (1 - AIRPORT_AI_DEPARTURE_CYCLE_START)
+      : ((elapsedTime / plane.cycleDuration) + plane.phase) % 1;
     const sample = sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth);
-    const nextTime = elapsedTime + 0.08;
-    const nextCycle = ((nextTime / plane.cycleDuration) + plane.phase) % 1;
+    const nextTime = elapsedTime + delta;
+    const nextDepartureProgress = (nextTime - plane.takeoffStartTime) / plane.cycleDuration;
+    const nextCycle = plane.state === "departing"
+      ? AIRPORT_AI_DEPARTURE_CYCLE_START + Math.max(0, Math.min(1, nextDepartureProgress)) * (1 - AIRPORT_AI_DEPARTURE_CYCLE_START)
+      : ((nextTime / plane.cycleDuration) + plane.phase) % 1;
     const nextSample = sampleAirportTrafficState(plane, nextCycle, thresholdNorth, thresholdSouth);
+    if (plane.state === "departing") {
+      sample.z += runwayEndOffset;
+      nextSample.z += runwayEndOffset;
+    }
     const dx = nextSample.x - sample.x;
     const dy = nextSample.y - sample.y;
     const dz = nextSample.z - sample.z;
@@ -4577,18 +5195,100 @@ function updateAirportTraffic(elapsedTime) {
     const yaw = Math.atan2(dx, dz);
     const pitch = Math.atan2(dy, Math.max(0.001, horizontalLength));
 
+    if (
+      plane.state === "departing"
+      && airportDepartureInProgress === plane
+      && !plane.departureAirborneReleased
+      && sample.y - runwayBaseY >= AIRPORT_AI_TAKEOFF_AIRBORNE_ALTITUDE
+    ) {
+      airportDepartureInProgress = null;
+      plane.departureAirborneReleased = true;
+    }
+
     plane.mesh.position.set(sample.x, sample.y, sample.z);
     plane.mesh.rotation.set(0, yaw, 0, "YXZ");
     plane.mesh.rotateY(-Math.PI / 2);
     plane.mesh.rotateZ(-pitch * 0.35);
     setAircraftGearDeployed(plane.mesh, sample.y - terrainHeight(sample.x, sample.z) <= 5.5);
 
-    const onRunway = sample.y <= airportBaseTerrainHeight() + 1.62 && sample.z >= thresholdNorth && sample.z <= thresholdSouth;
+    const onRunway = sample.y <= runwayBaseY + 1.62 && sample.z >= thresholdNorth && sample.z <= thresholdSouth;
     if (onRunway && !plane.wasOnRunway) {
-      createTouchdownSmoke(sample.x, airportBaseTerrainHeight(), sample.z, yaw, 0.9);
+      createTouchdownSmoke(sample.x, runwayBaseY, sample.z, yaw, 0.9);
     }
     plane.wasOnRunway = onRunway;
+
+    if (plane.state === "approach" && sample.z >= thresholdSouth - 8 && sample.z <= thresholdSouth + 6 && sample.y <= runwayBaseY + 2.8) {
+      if (!airportDepartureInProgress) {
+        airportDepartureInProgress = plane;
+        plane.departureAirborneReleased = true;
+      }
+      plane.state = "taxiToPark";
+      plane.taxiAxis = "x";
+      plane.holdRemaining = 0;
+      plane.mesh.rotation.set(0, plane.parkingYaw, 0, "YXZ");
+      setAircraftGearDeployed(plane.mesh, true);
+      plane.wasOnRunway = false;
+    }
   }
+}
+
+function moveAirportPlaneAxisAligned(plane, targetX, targetY, targetZ, speed, dt, axis) {
+  const currentY = plane.mesh.position.y;
+  const dx = targetX - plane.mesh.position.x;
+  const dy = targetY - currentY;
+  const dz = targetZ - plane.mesh.position.z;
+  const moveX = axis === "x" ? dx : 0;
+  const moveY = dy;
+  const moveZ = axis === "z" ? dz : 0;
+
+  const distance = Math.hypot(moveX, moveY, moveZ);
+  if (distance <= 0.22) {
+    plane.mesh.position.set(
+      axis === "x" ? targetX : plane.mesh.position.x,
+      targetY,
+      axis === "z" ? targetZ : plane.mesh.position.z,
+    );
+    return true;
+  }
+
+  const move = Math.max(0, speed * dt);
+  if (move <= 0) {
+    return false;
+  }
+  const step = Math.min(move, distance);
+  const invDistance = 1 / Math.max(distance, 0.0001);
+  plane.mesh.position.x += moveX * invDistance * step;
+  plane.mesh.position.y += moveY * invDistance * step;
+  plane.mesh.position.z += moveZ * invDistance * step;
+
+  const yaw = Math.atan2(moveX, moveZ);
+  plane.mesh.rotation.set(0, yaw, 0, "YXZ");
+  return false;
+}
+
+function moveAirportPlaneTowards(plane, targetX, targetY, targetZ, speed, dt, fixedYaw = null) {
+  const dx = targetX - plane.mesh.position.x;
+  const dy = targetY - plane.mesh.position.y;
+  const dz = targetZ - plane.mesh.position.z;
+  const distance = Math.hypot(dx, dy, dz);
+  if (distance <= 0.22) {
+    plane.mesh.position.set(targetX, targetY, targetZ);
+    return true;
+  }
+
+  const move = Math.max(0, speed * dt);
+  if (move <= 0) {
+    return false;
+  }
+  const step = Math.min(move, distance);
+  const invDistance = 1 / Math.max(distance, 0.0001);
+  plane.mesh.position.x += dx * invDistance * step;
+  plane.mesh.position.y += dy * invDistance * step;
+  plane.mesh.position.z += dz * invDistance * step;
+
+  const yaw = fixedYaw ?? Math.atan2(dx, dz);
+  plane.mesh.rotation.set(0, yaw, 0, "YXZ");
+  return false;
 }
 
 function sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth) {
@@ -4616,8 +5316,7 @@ function sampleAirportTrafficState(plane, cycle, thresholdNorth, thresholdSouth)
     altitude = THREE.MathUtils.lerp(2.4, plane.cruiseAltitude, smoothstep(t));
   } else {
     const t = (cycle - 0.78) / 0.22;
-    const turnWidth = 44 + plane.departureDistance * 0.12;
-    worldX = x + turnWidth * plane.turnSide;
+    worldX = x;
     z = THREE.MathUtils.lerp(thresholdSouth + plane.departureDistance, thresholdNorth - plane.approachDistance, t);
     altitude = THREE.MathUtils.lerp(plane.cruiseAltitude, plane.cruiseAltitude - 2, t);
   }
@@ -4707,15 +5406,116 @@ function updateBusTraffic(dt) {
   busState.mesh.rotation.set(0, Math.PI - directionYaw, 0, "YXZ");
 }
 
+function updateForestAnimals(dt) {
+  if (forestAnimals.length === 0) {
+    return;
+  }
+
+  for (const animal of forestAnimals) {
+    const mesh = animal.mesh;
+    if (!mesh) {
+      continue;
+    }
+
+    const dx = animal.targetX - mesh.position.x;
+    const dz = animal.targetZ - mesh.position.z;
+    const distance = Math.hypot(dx, dz);
+    if (distance < 0.4) {
+      pickForestAnimalTarget(animal);
+    }
+
+    const travel = animal.speed * dt;
+    if (distance > 0.001 && travel > 0) {
+      const nx = dx / distance;
+      const nz = dz / distance;
+      const step = Math.min(travel, distance);
+      mesh.position.x += nx * step;
+      mesh.position.z += nz * step;
+      mesh.rotation.y = Math.atan2(nx, nz);
+    }
+
+    const toHomeDx = mesh.position.x - animal.homeX;
+    const toHomeDz = mesh.position.z - animal.homeZ;
+    const toHomeDistance = Math.hypot(toHomeDx, toHomeDz);
+    if (toHomeDistance > animal.homeRadius) {
+      const directionX = -toHomeDx / Math.max(toHomeDistance, 0.001);
+      const directionZ = -toHomeDz / Math.max(toHomeDistance, 0.001);
+      const correction = Math.min(1.4 * dt, toHomeDistance);
+      mesh.position.x += directionX * correction;
+      mesh.position.z += directionZ * correction;
+    }
+
+    animal.runPhase += dt * 7.2;
+    const bob = Math.sin(animal.runPhase) * animal.bob;
+    mesh.position.y = terrainHeight(mesh.position.x, mesh.position.z) + animal.baseY + bob;
+
+    for (let i = 0; i < animal.legs.length; i += 1) {
+      const leg = animal.legs[i];
+      leg.mesh.rotation.x = Math.sin(animal.runPhase + leg.phase) * animal.stride;
+    }
+  }
+}
+
+function updateFlyingBirds(dt) {
+  if (flyingBirds.length === 0) {
+    return;
+  }
+
+  for (const bird of flyingBirds) {
+    const mesh = bird.mesh;
+  if (bird.isPerched) {
+    bird.retargetInSeconds -= dt;
+    if (bird.retargetInSeconds <= 0) {
+      bird.isLanding = false;
+      pickBirdTarget(bird);
+    }
+    continue;
+  }
+
+    const targetX = bird.targetX - mesh.position.x;
+    const targetY = bird.targetY - mesh.position.y;
+    const targetZ = bird.targetZ - mesh.position.z;
+    const distanceToTarget = Math.hypot(targetX, targetY, targetZ);
+
+    if (distanceToTarget <= 4 || bird.retargetInSeconds <= 0) {
+      if (bird.isLanding && !bird.isPerched) {
+        bird.isPerched = true;
+        bird.wingLeft.rotation.z = Math.PI / 3;
+        bird.wingRight.rotation.z = -Math.PI / 3;
+      } else {
+        pickBirdTarget(bird);
+      }
+      continue;
+    }
+
+    const move = bird.speed * dt;
+    const normalizedDistance = Math.max(distanceToTarget, 0.001);
+    const step = Math.min(move, distanceToTarget);
+    mesh.position.x += (targetX / normalizedDistance) * step;
+    mesh.position.y += (targetY / normalizedDistance) * step;
+    mesh.position.z += (targetZ / normalizedDistance) * step;
+
+    const worldYaw = Math.atan2(targetX, targetZ);
+    const horizontalDistance = Math.hypot(targetX, targetZ);
+    const worldPitch = -Math.atan2(targetY, Math.max(horizontalDistance, 0.001));
+    mesh.rotation.set(worldPitch, worldYaw, 0, "YXZ");
+
+    bird.retargetInSeconds -= dt;
+    bird.flapPhase += dt * (4 + (bird.speed / 4));
+    const flap = Math.sin(bird.flapPhase) * 0.75;
+    bird.wingLeft.rotation.z = Math.PI / 3 - flap;
+    bird.wingRight.rotation.z = -Math.PI / 3 + flap;
+
+    if (bird.isLanding || !bird.isPerched) {
+      mesh.position.y = Math.max(terrainHeight(mesh.position.x, mesh.position.z) + 0.2, mesh.position.y);
+    }
+  }
+}
+
 function terrainBaseForSphereAt(x, z, radius) {
   let requiredCenterY = terrainHeight(x, z) + radius;
 
-  const rings = [
-    { scale: 0.5, samples: 8 },
-    { scale: 0.95, samples: 12 },
-  ];
-
-  for (const ring of rings) {
+  for (const ring of TERRAIN_CONTACT_SAMPLE_RINGS) {
     const d = radius * ring.scale;
     const centerLift = Math.sqrt(Math.max(0, radius * radius - d * d));
     for (let i = 0; i < ring.samples; i += 1) {
@@ -4728,6 +5528,20 @@ function terrainBaseForSphereAt(x, z, radius) {
   }
 
   return requiredCenterY - radius - GROUND_CONTACT_VISUAL_BIAS;
+}
+
+function createTerrainHeightSampler(positionAttribute) {
+  const gridSize = TERRAIN_SEGMENTS + 1;
+  const heights = new Float32Array(gridSize * gridSize);
+
+  for (let row = 0; row < gridSize; row += 1) {
+    for (let col = 0; col < gridSize; col += 1) {
+      const sourceIndex = (row * gridSize) + col;
+      heights[sourceIndex] = positionAttribute.getY(sourceIndex);
+    }
+  }
+
+  return { gridSize, heights };
 }
 
 function fbm(x, z, octaves, lacunarity, gain) {

@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node ./scripts/dev.mjs",
+    "dev": "node ./scripts/dev-runner.mjs .",
+    "start": "node ./scripts/dev-runner.mjs .",
+    "setup": "npm --prefix packages/client install",
+    "postinstall": "npm run setup",
     "dev:client": "npm --prefix packages/client run dev",
     "dev:server": "npm --prefix packages/server run dev",
     "test": "node ./scripts/test.mjs"
